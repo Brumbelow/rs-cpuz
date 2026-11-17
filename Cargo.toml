@@ -1,0 +1,60 @@
+[package]
+name = "rs-cpuz"
+version = "0.1.0"
+edition = "2021"
+authors = ["Andrew Brumbelow"]
+description = "System profiler for Windows: CPU, mainboard, memory, SPD and graphics details in a compact tabbed window"
+license = "Apache-2.0"
+readme = "README.md"
+rust-version = "1.78"
+keywords = ["cpuid", "hardware", "smbios", "windows", "system-information"]
+categories = ["hardware-support", "os::windows-apis"]
+
+[[bin]]
+name = "rs-cpuz"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Wdk_Graphics_Direct3D",
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Devices_Usb",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_EventLog",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Performance",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
