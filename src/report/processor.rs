@@ -179,7 +179,8 @@ fn socket_details(cpu: &CpuInfo, clocks: Option<&ClockSnapshot>) -> Lines {
     out
 }
 
-/// Speed of the first core, its multiplier and the bus speed, then the bus clock on its own.
+/// Speed of the first core, its multiplier and the bus speed, the multiplier range, then the
+/// bus clock on its own.
 fn clock_summary(out: &mut Lines, clocks: &ClockSnapshot) {
     let megahertz = |mhz: f64| format!("{mhz:.1} MHz");
     if let Some(core) = clocks.cores.first() {
@@ -187,6 +188,10 @@ fn clock_summary(out: &mut Lines, clocks: &ClockSnapshot) {
         if let (Some(multiplier), Some(bus)) = (core.multiplier, clocks.bus_mhz) {
             out.pair(1, "Multiplier x Bus Speed", format!("{multiplier:.1} x {bus:.1} MHz"));
         }
+    }
+    // Only the processor's own registers state the lowest multiplier.
+    if let (Some(lowest), Some(highest)) = (clocks.multiplier_min, clocks.multiplier_max) {
+        out.pair(1, "Multiplier range", format!("{lowest:.1} - {highest:.1}"));
     }
     out.opt(1, "Base frequency (cores)", clocks.bus_mhz.map(megahertz));
     out.opt(1, "Rated Bus speed", clocks.rated_fsb_mhz.map(megahertz));
@@ -637,12 +642,13 @@ mod tests {
             "\tTDP Limit\t\t65.0 Watts",
             "\tCore Speed\t\t5136.6 MHz",
             "\tMultiplier x Bus Speed\t51.5 x 99.7 MHz",
+            "\tMultiplier range\t4.0 - 53.5",
             "\tBase frequency (cores)\t99.7 MHz",
             "\tStock frequency\t\t3800 MHz",
         ];
         assert_eq!(lines[..expected.len()], expected);
-        assert!(lines[18].starts_with("\tInstructions sets\tMMX (+), SSE, SSE2, "));
-        assert!(lines[18].ends_with(", FMA3, SHA"));
+        assert!(lines[19].starts_with("\tInstructions sets\tMMX (+), SSE, SSE2, "));
+        assert!(lines[19].ends_with(", FMA3, SHA"));
         let rest = [
             "\tMicrocode Revision\t0xA601203",
             "\tL1 Data cache\t\t8 x 32 KB (8-way, 64-byte line)",
@@ -654,7 +660,7 @@ mod tests {
             "\tMax CPUID ext. level\t80000027h",
             "\tClock Speed 0\t\t5136.63 MHz (Core #0)",
         ];
-        assert_eq!(lines[19..19 + rest.len()], rest);
+        assert_eq!(lines[20..20 + rest.len()], rest);
         assert_eq!(lines[lines.len() - 3], "\tClock Speed 7\t\t5147.97 MHz (Core #7)");
         assert_eq!(lines[lines.len() - 2], "\tClock Speed 8\t\t99.74 MHz (CPU BCLK)");
         assert_eq!(lines[lines.len() - 1], "");
@@ -738,6 +744,19 @@ mod tests {
                 ""
             ]
         );
+    }
+
+    #[test]
+    fn states_the_multiplier_range_only_with_both_ends() {
+        let range = |clocks: &ClockSnapshot| {
+            let lines = lines_of(&information(&CpuInfo { cores: 2, ..Default::default() }, Some(clocks)));
+            lines.into_iter().find(|line| line.contains("Multiplier range"))
+        };
+        let clocks =
+            ClockSnapshot { multiplier_min: Some(8.0), multiplier_max: Some(52.0), ..Default::default() };
+        assert_eq!(range(&clocks).as_deref(), Some("\tMultiplier range\t8.0 - 52.0"));
+        // User mode knows at most the highest.
+        assert_eq!(range(&ClockSnapshot { multiplier_min: None, ..clocks }), None);
     }
 
     #[test]

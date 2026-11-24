@@ -262,7 +262,8 @@ const fn intel_igpu(device: u16, eus: u32) -> Model {
 }
 
 /// Texture-unit counts are listed for Pascal only, where NVIDIA documents eight per
-/// shader cluster; rows without a power figure have reference and partner designs
+/// shader cluster; later NVIDIA designs derive theirs from the core count (see
+/// [`texture_units`]). Rows without a power figure have reference and partner designs
 /// that differ, and rows without a memory type shipped with more than one.
 static MODELS: &[Model] = &[
     // GeForce GTX 10.
@@ -347,6 +348,27 @@ static MODELS: &[Model] = &[
     intel_igpu(0x4693, 16), // UHD Graphics 710
     intel_igpu(0xA780, 32), // UHD Graphics 770
 ];
+
+/// Texture units of a product: the figure its row lists, or for NVIDIA's Turing, Ampere,
+/// Ada and Blackwell chips four per streaming multiprocessor, worked out from the row's
+/// core count (64 cores per multiprocessor on Turing, 128 since Ampere). A core count
+/// that does not divide evenly is not one of those designs and gives `None`.
+pub fn texture_units(chip: Option<&Chip>, model: Option<&Model>) -> Option<u32> {
+    let model = model?;
+    if model.tmus.is_some() {
+        return model.tmus;
+    }
+    if model.vendor != NVIDIA {
+        return None;
+    }
+    let cores_per_unit = match chip?.codename.get(..2)? {
+        "TU" => 16,
+        "GA" | "AD" | "GB" => 32,
+        _ => return None,
+    };
+    let cores = model.cores?;
+    (cores % cores_per_unit == 0).then_some(cores / cores_per_unit)
+}
 
 /// Product details for a PCI vendor / device pair.
 pub fn model(vendor: u16, device: u16) -> Option<&'static Model> {
@@ -441,6 +463,25 @@ mod tests {
                 assert!(!hidden, "{later:?} is unreachable behind {entry:?}");
             }
         }
+    }
+
+    #[test]
+    fn derives_texture_units_from_the_architecture() {
+        let tmus = |device, revision| texture_units(chip(NVIDIA, device, revision), model(NVIDIA, device));
+        // Ada and Ampere: four per 128-core streaming multiprocessor.
+        assert_eq!(tmus(0x2803, 0xA1), Some(136)); // RTX 4060 Ti, AD106
+        assert_eq!(tmus(0x2684, 0xA1), Some(512)); // RTX 4090, AD102
+        assert_eq!(tmus(0x2206, 0xA1), Some(272)); // RTX 3080, GA102
+        assert_eq!(tmus(0x2B85, 0xA1), Some(680)); // RTX 5090, GB202
+                                                   // Turing: four per 64-core streaming multiprocessor.
+        assert_eq!(tmus(0x1E04, 0xA1), Some(272)); // RTX 2080 Ti, TU102
+        assert_eq!(tmus(0x1F82, 0xA1), Some(56)); // GTX 1650, TU117
+                                                  // Pascal rows list theirs.
+        assert_eq!(tmus(0x1B80, 0xA1), Some(160));
+        // No chip, no model, or a vendor without the rule: unknown.
+        assert_eq!(texture_units(None, model(NVIDIA, 0x2803)), None);
+        assert_eq!(texture_units(chip(NVIDIA, 0x2803, 0xA1), None), None);
+        assert_eq!(texture_units(chip(AMD, 0x744C, 0xC8), model(AMD, 0x744C)), None);
     }
 
     #[test]

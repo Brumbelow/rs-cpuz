@@ -31,6 +31,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     if env::var_os("CARGO_CFG_WINDOWS").is_none() {
         return Ok(());
     }
+    // The DLLs the executable imports are looked up in the system directory only, never
+    // next to it: a DLL dropped beside a program that runs elevated must not be loaded.
+    // GNU ld has no such switch; the program restricts its own later loads at startup.
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+    }
 
     // The resource script names its files without a directory: the resource
     // compiler looks them up in `OUT_DIR`, where all of them are written.

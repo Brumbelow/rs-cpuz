@@ -34,7 +34,7 @@ fn describe(smbios: Option<&Smbios>, pci: &[PciDevice], cpu: &CpuInfo) -> Mainbo
     let isa = pci.iter().find(|d| d.bus == 0 && has_class(d, ISA_BRIDGE));
 
     MainboardInfo {
-        bus_specs: bus_specs(pci, host),
+        bus_specs: bus_specs(pci, host, cpu),
         chipset: host.map(|bridge| northbridge(bridge, cpu)),
         southbridge: isa.map(|bridge| southbridge(bridge, host, retail_model)),
         lpcio: None,
@@ -81,15 +81,16 @@ fn bridge_info(device: &PciDevice, model: String) -> BridgeInfo {
 
 /// `PCI-Express 5.0 (32.0 GT/s)`: the fastest link the bridges on bus 0 support.
 /// Windows rarely publishes link capabilities for bridges, so when none reports
-/// one the speed documented for the platform's root ports stands in.
-fn bus_specs(pci: &[PciDevice], host: Option<&PciDevice>) -> Option<String> {
+/// one the speed documented for the platform's root ports stands in: by host bridge
+/// on AMD, by processor die on Intel.
+fn bus_specs(pci: &[PciDevice], host: Option<&PciDevice>, cpu: &CpuInfo) -> Option<String> {
     let reported = pci
         .iter()
         .filter(|d| d.bus == 0 && has_class(d, PCI_BRIDGE))
         .filter_map(|d| d.link?.max_speed_gts)
         .max_by(f32::total_cmp);
     let documented = || chipset::host_bridge(host?.vendor_id, host?.device_id)?.root_port_gts;
-    let speed = reported.or_else(documented)?;
+    let speed = reported.or_else(documented).or_else(|| chipset::intel_root_port_gts(cpu))?;
     Some(format!("PCI-Express {}.0 ({speed:.1} GT/s)", PcieLink::generation(speed)?))
 }
 
@@ -238,6 +239,23 @@ mod tests {
     }
 
     #[test]
+    fn bus_specs_follow_the_intel_processor_generation() {
+        // Windows publishes no link capabilities for the root ports, so the processor's
+        // own PCI Express generation stands in: the S and HX dies have Gen 5, the P die Gen 4.
+        let devices = [device((0, 0, 0), (INTEL, 0xA703), HOST_BRIDGE, 0x01)];
+        let intel =
+            |ext_model| CpuInfo { vendor: CpuVendor::Intel, ext_family: 6, ext_model, ..CpuInfo::default() };
+        let specs = |cpu: &CpuInfo| describe(None, &devices, cpu).bus_specs;
+        assert_eq!(specs(&intel(0xB7)).as_deref(), Some("PCI-Express 5.0 (32.0 GT/s)"));
+        assert_eq!(specs(&intel(0xBA)).as_deref(), Some("PCI-Express 4.0 (16.0 GT/s)"));
+        assert_eq!(specs(&intel(0xA5)).as_deref(), Some("PCI-Express 3.0 (8.0 GT/s)"));
+        // A generation the table does not settle stays blank.
+        assert_eq!(specs(&intel(0xAA)), None);
+        // The family numbers only mean this for Intel.
+        assert_eq!(specs(&CpuInfo { vendor: CpuVendor::Amd, ..intel(0xB7) }), None);
+    }
+
+    #[test]
     fn southbridge_falls_back_to_the_family() {
         let oem = smbios(vec![structure(kind::BASEBOARD, &["EXAMPLE", "0KWVT8", "A00"])]);
         let board = describe(Some(&oem), &am5_devices(), &CpuInfo::default());
@@ -285,24 +303,39 @@ mod tests {
         devices[2].link = link(8, 16, 16.0, 16.0);
         devices[3].link = link(16, 16, 8.0, 8.0);
         let host = devices.first();
-        assert_eq!(bus_specs(&devices, host).as_deref(), Some("PCI-Express 4.0 (16.0 GT/s)"));
+        assert_eq!(
+            bus_specs(&devices, host, &CpuInfo::default()).as_deref(),
+            Some("PCI-Express 4.0 (16.0 GT/s)")
+        );
 
         // Bridges behind bus 0 and non-bridges do not count.
         let elsewhere = [
             linked(device((3, 0, 0), (AMD, 0x43F4), PCI_BRIDGE, 0x01), link(4, 4, 16.0, 64.0)),
             linked(device((0, 2, 0), (INTEL, 0x4680), (0x03, 0x00), 0x0C), link(1, 1, 2.5, 2.5)),
         ];
-        assert_eq!(bus_specs(&elsewhere, None), None);
+        assert_eq!(bus_specs(&elsewhere, None, &CpuInfo::default()), None);
     }
 
     #[test]
     fn bus_specs_format_every_generation() {
         let port =
             |speed| [linked(device((0, 1, 0), (INTEL, 0x0001), PCI_BRIDGE, 0), link(1, 1, 2.5, speed))];
-        assert_eq!(bus_specs(&port(2.5), None).as_deref(), Some("PCI-Express 1.0 (2.5 GT/s)"));
-        assert_eq!(bus_specs(&port(5.0), None).as_deref(), Some("PCI-Express 2.0 (5.0 GT/s)"));
-        assert_eq!(bus_specs(&port(8.0), None).as_deref(), Some("PCI-Express 3.0 (8.0 GT/s)"));
-        assert_eq!(bus_specs(&port(64.0), None).as_deref(), Some("PCI-Express 6.0 (64.0 GT/s)"));
+        assert_eq!(
+            bus_specs(&port(2.5), None, &CpuInfo::default()).as_deref(),
+            Some("PCI-Express 1.0 (2.5 GT/s)")
+        );
+        assert_eq!(
+            bus_specs(&port(5.0), None, &CpuInfo::default()).as_deref(),
+            Some("PCI-Express 2.0 (5.0 GT/s)")
+        );
+        assert_eq!(
+            bus_specs(&port(8.0), None, &CpuInfo::default()).as_deref(),
+            Some("PCI-Express 3.0 (8.0 GT/s)")
+        );
+        assert_eq!(
+            bus_specs(&port(64.0), None, &CpuInfo::default()).as_deref(),
+            Some("PCI-Express 6.0 (64.0 GT/s)")
+        );
     }
 
     #[test]

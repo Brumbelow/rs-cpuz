@@ -79,6 +79,22 @@ fn opt(value: &Option<String>) -> String {
     value.clone().unwrap_or_default()
 }
 
+/// `8 x 48 + 8 x 32 KB`, `96 MB + 32 MB`: the caches of one level in a single box. When
+/// the entries count instances (the core types of a hybrid part) and share a unit, the
+/// unit is written once so that the line fits the box.
+fn joined_sizes(caches: &[&CacheInfo]) -> String {
+    let texts: Vec<String> = caches.iter().map(|c| c.short_size_text()).collect();
+    let split: Vec<(&str, &str)> = texts.iter().filter_map(|text| text.rsplit_once(' ')).collect();
+    let shared_unit = split.len() == texts.len() && split.windows(2).all(|pair| pair[0].1 == pair[1].1);
+    match split.first() {
+        Some((_, unit)) if shared_unit && caches.iter().any(|c| c.count > 1) => {
+            let numbers: Vec<&str> = split.iter().map(|(number, _)| *number).collect();
+            format!("{} {unit}", numbers.join(" + "))
+        }
+        _ => texts.join(" + "),
+    }
+}
+
 fn cpu_text(view: &View, id: u16) -> Option<String> {
     let cpu = &view.sys.cpu;
     let clocks = view.clocks;
@@ -87,7 +103,7 @@ fn cpu_text(view: &View, id: u16) -> Option<String> {
     // A level that mixes cache sizes lists them all, in the compact form the box has room for.
     let size = |caches: Vec<&CacheInfo>| match caches[..] {
         [single] => single.size_text(),
-        _ => caches.iter().map(|c| c.short_size_text()).collect::<Vec<_>>().join(" + "),
+        _ => joined_sizes(&caches),
     };
     // The associativity is shown when it holds for every cache on the line.
     let ways = |caches: Vec<&CacheInfo>| match caches[..] {
@@ -304,6 +320,10 @@ fn about_text(view: &View, id: u16) -> Option<String> {
         about::NAME => brand::APP_NAME.to_string(),
         about::VERSION => format::long_version(brand::VERSION),
         about::LICENSE => format!("License: {}", env!("CARGO_PKG_LICENSE")),
+        // Detection always names the driver's state; the sample system was not detected.
+        about::ACCESS if !view.sys.access.driver.is_empty() => view.sys.access.text(),
+        about::ACCESS => String::new(),
+        about::NOTES => notes_text(&view.sys.notes),
         about::OS_NAME => os.name.clone(),
         about::OS_BUILD => os.build.clone(),
         about::DIRECTX => os.directx.as_ref().map(|version| format!("DirectX {version}")).unwrap_or_default(),
@@ -311,11 +331,21 @@ fn about_text(view: &View, id: u16) -> Option<String> {
     })
 }
 
+/// What detection could not read: the note itself when there is one, how many parts
+/// when the notes would not fit on the line.
+fn notes_text(notes: &[String]) -> String {
+    match notes {
+        [] => String::new(),
+        [note] => note.clone(),
+        _ => format!("{} parts not read, see the report", notes.len()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::demo;
-    use crate::model::{ClockSnapshot, SystemInfo};
+    use crate::model::{AccessInfo, ClockSnapshot, SystemInfo};
     use crate::ui::layout::STATIC;
     use crate::ui::state::UiState;
 
@@ -385,6 +415,64 @@ mod tests {
         assert_eq!(level3(16), ("96 MB + 32 MB".to_string(), "16-way".to_string()));
         // An associativity that holds for one of the caches only is not shown.
         assert_eq!(level3(12), ("96 MB + 32 MB".to_string(), String::new()));
+    }
+
+    #[test]
+    fn caches_of_two_core_types_share_their_unit_in_a_box() {
+        // A hybrid package: the P-cores' caches, then the E-cores', in each box.
+        let mut sys = demo::system();
+        let entry = |level, kind, size_kb, count| CacheInfo {
+            level,
+            kind,
+            size_kb,
+            count,
+            ways: 8,
+            ..sys.cpu.caches[0]
+        };
+        sys.cpu.caches = vec![
+            entry(1, CacheKind::Data, 48, 8),
+            entry(1, CacheKind::Data, 32, 8),
+            entry(1, CacheKind::Instruction, 32, 8),
+            entry(1, CacheKind::Instruction, 64, 8),
+            entry(2, CacheKind::Unified, 2048, 8),
+            entry(2, CacheKind::Unified, 4096, 2),
+            entry(2, CacheKind::Unified, 512, 4),
+        ];
+        let clocks = demo::clocks();
+        let ui = UiState::new(&sys, None, 16, Vec::new());
+        let v = View { sys: &sys, clocks: &clocks, ui: &ui };
+        assert_eq!(value(&v, Tab::Cpu, cpu::L1_DATA), "8 x 48 + 8 x 32 KB");
+        assert_eq!(value(&v, Tab::Cpu, cpu::L1_INST), "8 x 32 + 8 x 64 KB");
+        // Units that differ stay with their sizes.
+        assert_eq!(value(&v, Tab::Cpu, cpu::LEVEL2), "8 x 2 MB + 2 x 4 MB + 4 x 512 KB");
+    }
+
+    #[test]
+    fn about_page_tells_the_rights() {
+        let mut sys = demo::system();
+        sys.access = AccessInfo { administrator: false, driver: "PawnIO: needs administrator".into() };
+        let clocks = demo::clocks();
+        let ui = UiState::new(&sys, None, 16, Vec::new());
+        let v = View { sys: &sys, clocks: &clocks, ui: &ui };
+        assert_eq!(value(&v, Tab::About, about::ACCESS), "Administrator: no · PawnIO: needs administrator");
+    }
+
+    #[test]
+    fn about_page_tells_what_was_not_read() {
+        let mut sys = demo::system();
+        let clocks = demo::clocks();
+        let ui = UiState::new(&sys, None, 16, Vec::new());
+        assert_eq!(value(&View { sys: &sys, clocks: &clocks, ui: &ui }, Tab::About, about::NOTES), "");
+        sys.notes = vec!["Drives: not read, no answer in time".into()];
+        assert_eq!(
+            value(&View { sys: &sys, clocks: &clocks, ui: &ui }, Tab::About, about::NOTES),
+            "Drives: not read, no answer in time"
+        );
+        sys.notes.push("USB devices: not read, the detection failed".into());
+        assert_eq!(
+            value(&View { sys: &sys, clocks: &clocks, ui: &ui }, Tab::About, about::NOTES),
+            "2 parts not read, see the report"
+        );
     }
 
     #[test]
@@ -539,6 +627,8 @@ mod tests {
             assert!(value(v, Tab::About, about::VERSION).starts_with("Version "));
             assert_eq!(value(v, Tab::About, about::OS_NAME), "Microsoft Windows 11 Home (x64)");
             assert_eq!(value(v, Tab::About, about::DIRECTX), "DirectX 12.0");
+            // The sample system was not detected, so it says nothing about rights.
+            assert_eq!(value(v, Tab::About, about::ACCESS), "");
             assert_eq!(value(v, Tab::About, about::SAVE_TXT), "Save Report (.TXT)");
         });
     }

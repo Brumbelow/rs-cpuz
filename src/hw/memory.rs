@@ -9,6 +9,7 @@
 mod channels;
 mod dmi;
 mod jedec;
+pub mod spd;
 mod speed;
 
 use std::mem::size_of;
@@ -54,7 +55,10 @@ fn summarize(slots: &[Slot], firmware_bus_mhz: Option<u16>) -> MemoryInfo {
         kind: kind.map(|kind| kind.name().to_string()),
         size_mb: installed.iter().map(|slot| slot.module.size_mb).sum(),
         channels: kind
-            .zip(channels::populated(labels))
+            .zip(
+                channels::populated(labels)
+                    .or_else(|| channels::interleaved(installed.iter().map(|s| s.interleave))),
+            )
             .and_then(|(kind, count)| channels::describe(kind, count)),
         dram_mhz: rate.map(DataRate::clock_mhz),
         max_dram_mhz: max_rate.map(DataRate::clock_mhz),
@@ -97,7 +101,7 @@ fn os_memory_mb() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::dmi::fixtures::{array, parse, smbios, system, table, Device};
+    use super::dmi::fixtures::{array, mapped, parse, smbios, system, table, Device};
     use super::*;
 
     /// A DDR4 SODIMM of `size_mb` running at `configured` MT/s.
@@ -199,6 +203,38 @@ mod tests {
         assert_eq!(info.size_mb, 16 * 1024);
         assert!(info.channels.is_none());
         assert_eq!(info.fsb_dram.as_deref(), Some("1:16"));
+    }
+
+    /// Two unlabelled slots (`DIMM1`, `DIMM2`, handles 0x1100 and 0x1101) whose type 20
+    /// records give `positions` as their interleave positions.
+    fn interleaved(modules: [Device; 2], positions: [u8; 2]) -> MemoryInfo {
+        let records =
+            [array(0x1000, 0x03, 0x03), mapped(0x1100, positions[0], 1), mapped(0x1101, positions[1], 1)];
+        summarize(&dmi::slots(&smbios(&records, &modules)), None)
+    }
+
+    #[test]
+    fn interleave_positions_count_the_channels_of_unlabelled_slots() {
+        let ddr5 = interleaved([Device::ddr5("DIMM1", ""), Device::ddr5("DIMM2", "")], [1, 2]);
+        assert_eq!(ddr5.channels.as_deref(), Some("4 x 32-bit"));
+        let ddr4 = interleaved([ddr4("DIMM1", "", 8192, 3200), ddr4("DIMM2", "", 8192, 3200)], [2, 1]);
+        assert_eq!(ddr4.channels.as_deref(), Some("Dual"));
+    }
+
+    #[test]
+    fn interleave_positions_that_prove_nothing_leave_the_channels_unknown() {
+        let modules = || [Device::ddr5("DIMM1", ""), Device::ddr5("DIMM2", "")];
+        // Firmware that writes the same position everywhere, or none, or "unknown".
+        for positions in [[1, 1], [0, 0], [0xFF, 0xFF], [1, 0xFF], [2, 3]] {
+            assert!(interleaved(modules(), positions).channels.is_none(), "{positions:?}");
+        }
+    }
+
+    #[test]
+    fn slot_labels_outrank_interleave_positions() {
+        // The labels place both modules on channel A; the positions would say two channels.
+        let modules = [Device::ddr5("DIMM_A1", ""), Device::ddr5("DIMM_A2", "")];
+        assert_eq!(interleaved(modules, [1, 2]).channels.as_deref(), Some("2 x 32-bit"));
     }
 
     #[test]

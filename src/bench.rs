@@ -15,6 +15,14 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use std::mem::size_of;
+
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadInformation, SetThreadPriority, ThreadPowerThrottling,
+    THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+    THREAD_POWER_THROTTLING_STATE, THREAD_PRIORITY_BELOW_NORMAL,
+};
+
 use crate::hw::processors;
 use crate::model::CpuInfo;
 pub use references::{load_references, save_reference};
@@ -86,6 +94,36 @@ pub fn thread_limit(cpu: Option<&CpuInfo>) -> u32 {
     cpu.map_or(os, |cpu| logical_processors(cpu, os))
 }
 
+/// Opts the calling thread out of Windows' power throttling (EcoQoS), which slows the
+/// threads of a window that is not in the foreground. `false` when Windows refuses.
+fn run_at_full_speed() -> bool {
+    let state = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    // SAFETY: the pseudo handle of the current thread is always valid, and `state` is a live
+    // THREAD_POWER_THROTTLING_STATE of the size passed.
+    unsafe {
+        SetThreadInformation(
+            GetCurrentThread(),
+            ThreadPowerThrottling,
+            std::ptr::from_ref(&state).cast(),
+            size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        )
+        .is_ok()
+    }
+}
+
+/// Lowers the calling thread below normal priority, so that the window stays responsive
+/// while every processor is loaded.
+fn yield_to_the_window() {
+    // SAFETY: the pseudo handle of the current thread is always valid; a failure leaves the priority as it was.
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
 /// Logical processors of `cpu`, or `fallback` when detection could not tell.
 fn logical_processors(cpu: &CpuInfo, fallback: u32) -> u32 {
     let detected = u32::try_from(cpu.logical.len()).unwrap_or(u32::MAX);
@@ -145,6 +183,8 @@ impl Job {
                 let (stop, groups) = (Arc::clone(&cancel), Arc::clone(&groups));
                 let load = move || {
                     affinity::assign_worker(worker, &groups);
+                    run_at_full_speed();
+                    yield_to_the_window();
                     work(Duration::MAX, &stop);
                 };
                 thread::Builder::new().name("stress".into()).spawn(load).ok()
@@ -217,6 +257,10 @@ fn run_phase(
             let groups = &groups;
             let measure = move || {
                 affinity::assign_worker(worker, groups);
+                // Windows' scheduler finds the fastest core for a lone thread by itself (holding
+                // the thread on a chosen core measured slower), but throttles the threads of a
+                // window in the background unless they opt out.
+                run_at_full_speed();
                 work(duration, cancel)
             };
             match thread.spawn_scoped(scope, measure) {
@@ -281,6 +325,26 @@ fn progress(elapsed: Duration, duration: Duration) -> f32 {
 mod tests {
     use super::*;
     use std::sync::mpsc::{self, Receiver};
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+
+    #[test]
+    fn benchmark_threads_opt_out_of_power_throttling() {
+        assert!(thread::spawn(run_at_full_speed).join().unwrap());
+    }
+
+    #[test]
+    fn stress_threads_yield_to_the_window() {
+        let priority = thread::spawn(|| {
+            yield_to_the_window();
+            // SAFETY: the pseudo handle of the current thread is always valid.
+            unsafe { GetThreadPriority(GetCurrentThread()) }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(priority, THREAD_PRIORITY_BELOW_NORMAL.0);
+    }
 
     const SHORT: Duration = Duration::from_millis(50);
     /// Generous limit for anything that should happen "promptly", even on a loaded machine.

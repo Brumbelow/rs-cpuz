@@ -3,9 +3,11 @@
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::UpdateWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostQuitMessage, TranslateMessage, MSG,
-    WM_DESTROY, WM_ERASEBKGND, WM_NCDESTROY, WM_PAINT, WNDCLASS_STYLES, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_NCDESTROY, WM_PAINT, WNDCLASS_STYLES, WS_EX_APPWINDOW,
+    WS_POPUP,
 };
 
 use crate::brand;
@@ -61,13 +63,15 @@ pub fn draw(p: &Painter, stage: Stage) {
 }
 
 impl Splash {
-    fn handle(&mut self, hwnd: HWND, message: u32) -> Option<LRESULT> {
+    fn handle(&mut self, hwnd: HWND, message: u32, wparam: WPARAM) -> Option<LRESULT> {
         match message {
             WM_PAINT => {
                 let Splash { canvas, theme, stage } = self;
                 canvas.present(hwnd, theme, |p| draw(p, *stage));
             }
             WM_ERASEBKGND => return Some(LRESULT(1)),
+            // Esc gives up on the detection and ends the program, like closing the window.
+            WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => win::post_close(hwnd),
             // SAFETY: ends the splash's message loop; PostQuitMessage has no preconditions.
             WM_DESTROY => unsafe { PostQuitMessage(0) },
             _ => return None,
@@ -84,7 +88,7 @@ extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             win::release::<Splash>(hwnd);
             return DefWindowProcW(hwnd, message, wparam, lparam);
         }
-        win::with_state(hwnd, |splash: &mut Splash| splash.handle(hwnd, message))
+        win::with_state(hwnd, |splash: &mut Splash| splash.handle(hwnd, message, wparam))
             .flatten()
             .unwrap_or_else(|| DefWindowProcW(hwnd, message, wparam, lparam))
     }
@@ -119,25 +123,16 @@ fn wait_without_window(inbox: &Inbox) -> Option<Detected> {
 pub fn run(cfg: &Config, mailbox: &Mailbox, inbox: &Inbox) -> Option<Detected> {
     let state =
         Splash { theme: Theme::new(cfg), canvas: Canvas::new(cfg, BASE_DPI), stage: Stage::Processors };
-    let Some(hwnd) = win::create_window(CLASS, brand::APP_NAME, WS_POPUP, WS_EX_TOOLWINDOW, None, state)
+    // A taskbar button, so that a splash covered by other windows can still be found.
+    let Some(hwnd) = win::create_window(CLASS, brand::APP_NAME, WS_POPUP, WS_EX_APPWINDOW, None, state)
     else {
         return wait_without_window(inbox);
     };
-    // The window was created on the primary monitor, so its DPI is the one to lay out for.
-    let dpi = win::dpi_of(hwnd);
+    let dpi = win::place_on_pointer_monitor(hwnd, |dpi| Scale::new(dpi).size(splash::SIZE.0, splash::SIZE.1));
     // SAFETY: `hwnd` is the splash created above; its state is a `Splash`.
     unsafe {
         win::with_state(hwnd, |splash: &mut Splash| splash.canvas.set_dpi(cfg, dpi));
     }
-    let (window_width, window_height) = Scale::new(dpi).size(splash::SIZE.0, splash::SIZE.1);
-    let area = win::primary_work_area().unwrap_or(RECT {
-        left: 0,
-        top: 0,
-        right: window_width,
-        bottom: window_height,
-    });
-    let (x, y) = win::centred_in(area, window_width, window_height);
-    win::place(hwnd, x, y, window_width, window_height);
     win::show(hwnd);
     mailbox.listen(Some(hwnd));
 

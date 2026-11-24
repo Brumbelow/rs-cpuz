@@ -11,10 +11,12 @@ mod db;
 mod driver;
 mod dxgi;
 mod kmt;
+
+pub use kmt::Performance;
 mod nvapi;
 
 use super::pci;
-use crate::model::{GpuInfo, PciDevice};
+use crate::model::{GpuInfo, GpuPerfLevel, PciDevice};
 use driver::Driver;
 use dxgi::Adapter;
 
@@ -78,6 +80,11 @@ fn assemble(
         if let Some(found) = nvapi::pick(nvidia, &nvidia_taken, adapter, bus) {
             nvidia_taken[found] = true;
             apply_live(&mut gpu, &nvidia[found]);
+        }
+        // The vendor's own interface knows the rated clocks; for the others the graphics
+        // kernel tells the clocks in effect.
+        if gpu.perf_levels.is_empty() {
+            gpu.perf_levels = kernel_levels(&adapter.performance);
         }
         gpus.push(gpu);
     }
@@ -191,7 +198,7 @@ fn describe(adapter: &Adapter, driver: Option<&Driver>) -> GpuInfo {
         technology_nm: chip.and_then(|chip| chip.technology_nm),
         tdp_w: model.and_then(|model| model.tdp_w).map(f32::from),
         rops: model.and_then(|model| model.rops),
-        tmus: model.and_then(|model| model.tmus),
+        tmus: db::texture_units(chip, model),
         cores: model.and_then(|model| model.cores),
         perf_levels: Vec::new(),
         memory_mb: memory_mb(adapter, driver),
@@ -210,6 +217,43 @@ fn describe(adapter: &Adapter, driver: Option<&Driver>) -> GpuInfo {
         driver_date: driver.and_then(|driver| driver.date.clone()),
         primary: false,
     }
+}
+
+/// The performance levels the graphics kernel's readings make: the highest clocks the
+/// driver allows (`Max`, which can lie above the rated boost clock), then the clocks in
+/// effect (`Current`). A level without a single reading is left out.
+fn kernel_levels(performance: &kmt::Performance) -> Vec<GpuPerfLevel> {
+    let mhz = |hz: Option<u64>| hz.map(|hz| hz as f64 / 1e6);
+    let level = |name: &str, core: Option<u64>, memory: Option<u64>| {
+        (core.is_some() || memory.is_some()).then(|| GpuPerfLevel {
+            name: name.into(),
+            core_mhz: mhz(core),
+            shader_mhz: None,
+            memory_mhz: mhz(memory),
+        })
+    };
+    [
+        level("Max", performance.max_core_hz, performance.max_memory_hz),
+        level(GpuPerfLevel::CURRENT, performance.core_hz, performance.memory_hz),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The adapters whose sensors can be read again later: name and locally unique id.
+pub fn sensor_sources() -> Vec<(String, i64)> {
+    dxgi::enumerate()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|adapter| !adapter.software)
+        .map(|adapter| (adapter.name, adapter.luid))
+        .collect()
+}
+
+/// The temperature and fan readings of the adapter with id `luid`, as the graphics kernel has them.
+pub fn performance(luid: i64) -> Performance {
+    kmt::performance(dxgi::luid(luid))
 }
 
 /// Values read from the running driver take precedence over the tables.
@@ -396,6 +440,31 @@ mod tests {
     }
 
     #[test]
+    fn the_graphics_kernel_supplies_the_clocks_nvapi_does_not() {
+        let measured = kmt::Performance {
+            core_hz: Some(450_000_000),
+            max_core_hz: Some(1_600_000_000),
+            memory_hz: None,
+            max_memory_hz: Some(2_400_000_000),
+            ..kmt::Performance::default()
+        };
+        let mhz = |core: Option<f64>, memory: Option<f64>, name: &str| GpuPerfLevel {
+            name: name.into(),
+            core_mhz: core,
+            memory_mhz: memory,
+            ..GpuPerfLevel::default()
+        };
+        assert_eq!(
+            kernel_levels(&measured),
+            [mhz(Some(1600.0), Some(2400.0), "Max"), mhz(Some(450.0), None, GpuPerfLevel::CURRENT)]
+        );
+        // Without a reading there is no level, and a level needs one reading.
+        assert!(kernel_levels(&kmt::Performance::default()).is_empty());
+        let max_only = kmt::Performance { max_core_hz: Some(1_600_000_000), ..kmt::Performance::default() };
+        assert_eq!(kernel_levels(&max_only).len(), 1);
+    }
+
+    #[test]
     fn assembles_adapters_from_all_sources() {
         let pci = [
             PciDevice { base_class: 0x06, ..pci_device(0, 0x1022, 0x14D8, (0x1043, 0x8877), 0x00) },
@@ -436,7 +505,8 @@ mod tests {
         assert_eq!(card.technology_nm, Some(5));
         assert_eq!(card.tdp_w, Some(115.0));
         assert_eq!(card.rops, Some(48));
-        assert_eq!(card.tmus, None);
+        // Derived from the table's core count: four per streaming multiprocessor.
+        assert_eq!(card.tmus, Some(96));
         // The live core count replaces the table's, the table fills the missing bus width.
         assert_eq!(card.cores, Some(3000));
         assert_eq!(card.memory_bus_width, Some(128));

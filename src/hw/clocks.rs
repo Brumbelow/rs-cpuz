@@ -96,6 +96,7 @@ pub struct ClockMonitor {
     reference_mhz: f64,
     /// Steps per unit of the nominal ratio.
     ratio_parts: f64,
+    multiplier_min: Option<f64>,
     multiplier_max: Option<f64>,
 }
 
@@ -119,7 +120,12 @@ impl ClockMonitor {
             advertised_mhz: advertised.into_iter().flatten().filter(|mhz| *mhz > 0.0).collect(),
             reference_mhz,
             ratio_parts: ratio_parts(cpu.vendor),
-            multiplier_max: max_multiplier(cpu.vendor, frequency_leaf(cpu), firmware, reference_mhz),
+            // The processor's own registers, read through the driver, state the range exactly.
+            multiplier_min: cpu.ratio_range.map(|(lowest, _)| lowest),
+            multiplier_max: cpu
+                .ratio_range
+                .map(|(_, highest)| highest)
+                .or_else(|| max_multiplier(cpu.vendor, frequency_leaf(cpu), firmware, reference_mhz)),
         }
     }
 
@@ -153,7 +159,7 @@ impl ClockMonitor {
         ClockSnapshot {
             cores: core_clocks(&self.cores, &self.reported(), bus_mhz),
             bus_mhz,
-            multiplier_min: None,
+            multiplier_min: self.multiplier_min,
             multiplier_max: self.multiplier_max,
             rated_fsb_mhz: None,
         }

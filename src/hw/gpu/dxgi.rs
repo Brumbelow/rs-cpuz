@@ -1,6 +1,7 @@
 //! Display adapter enumeration through DXGI.
 
 use windows::core::Interface;
+use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, DXGI_ADAPTER_DESC1,
     DXGI_ADAPTER_FLAG_SOFTWARE,
@@ -13,6 +14,11 @@ const MAX_INDEX: u32 = 64;
 
 /// PCI ids of the "Microsoft Basic Render Driver" software rasteriser.
 const BASIC_RENDER_DRIVER: (u16, u16) = (0x1414, 0x008C);
+
+/// The `LUID` an adapter id packs: high part above, low part below.
+pub fn luid(packed: i64) -> LUID {
+    LUID { LowPart: packed as u32, HighPart: (packed >> 32) as i32 }
+}
 
 /// One adapter as DXGI describes it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -38,6 +44,8 @@ pub struct Adapter {
     pub wddm_version: Option<u32>,
     /// PCI bus, device and function, when the graphics kernel knows where the adapter sits.
     pub address: Option<(u8, u8, u8)>,
+    /// Clocks, temperature and fan as the driver reports them to the graphics kernel.
+    pub performance: kmt::Performance,
 }
 
 impl Adapter {
@@ -86,6 +94,7 @@ fn describe(adapter: &IDXGIAdapter1) -> Option<Adapter> {
         driver_version,
         wddm_version: kernel.wddm_version,
         address: kernel.address,
+        performance: kmt::performance(desc.AdapterLuid),
         ..from_desc(&desc)
     })
 }

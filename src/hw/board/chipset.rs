@@ -70,6 +70,28 @@ fn intel_host_bridge(device_id: u16) -> Option<HostBridge> {
     Some(HostBridge { name, root_port_gts: None, has_pch })
 }
 
+/// Fastest link speed in GT/s of the root ports of an Intel client platform, by the
+/// processor's die (family 6 model). Intel's host bridge ids are shared between the
+/// desktop and mobile dies of a family, which differ here: the S and HX dies of Alder,
+/// Raptor and Arrow Lake have Gen 5 lanes, their P and U dies Gen 4. Dies whose
+/// variants differ (Ivy Bridge), dies not listed and server parts give `None`.
+pub fn intel_root_port_gts(cpu: &CpuInfo) -> Option<f32> {
+    if cpu.vendor != CpuVendor::Intel || cpu.ext_family != 6 {
+        return None;
+    }
+    match cpu.ext_model {
+        // Sandy Bridge; Haswell-ULT and Broadwell-U, whose root ports are the PCH-LP's.
+        0x2A | 0x45 | 0x3D => Some(5.0),
+        // Haswell, Broadwell-H, Skylake, Kaby / Coffee / Whiskey / Comet Lake, Ice Lake, Alder Lake-N.
+        0x3C | 0x46 | 0x47 | 0x4E | 0x5E | 0x8E | 0x9E | 0xA5 | 0xA6 | 0x7D | 0x7E | 0xBE => Some(8.0),
+        // Rocket Lake, Tiger Lake, Alder Lake-P/U, Raptor Lake-P/U.
+        0xA7 | 0x8C | 0x8D | 0x9A | 0xBA => Some(16.0),
+        // Alder Lake-S/HX, Raptor Lake-S/HX, Arrow Lake-S/HX.
+        0x97 | 0xB7 | 0xBF | 0xC6 => Some(32.0),
+        _ => None,
+    }
+}
+
 /// Model text of the chipset row. The host bridge of current platforms is part
 /// of the processor, so the processor refines what the table says: server and
 /// desktop parts share root complex ids, and a host bridge missing from the

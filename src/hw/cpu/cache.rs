@@ -28,8 +28,9 @@ pub struct CacheDesc {
 #[derive(Debug, Clone)]
 pub struct ThreadCaches {
     pub apic_id: u32,
-    /// Whether the thread belongs to the core type whose caches are displayed.
-    pub displayed: bool,
+    /// Position of the thread's core type in display order: 0 for the cores
+    /// listed first (the performance cores of a hybrid part), 1 for the next type.
+    pub core_set: usize,
     pub caches: Vec<CacheDesc>,
 }
 
@@ -130,36 +131,50 @@ fn legacy_ways(code: u32) -> u32 {
     }
 }
 
-/// Folds the caches of every thread of a package into one entry per distinct
-/// cache of the displayed core type. A level whose caches differ between those
-/// cores (a stacked L3 on one core complex only) gets an entry for each, in the
-/// order the threads report them. Instances are told apart by the APIC-id bits
-/// above the sharing span, so `count` and `threads_sharing` reflect the real
-/// topology. `None` when a cache does not describe its sharing (the descriptor leaves).
+/// Folds the caches of every thread of a package into the per-package list. Each
+/// core type contributes its own entries, the first core set first (the performance
+/// cores of a hybrid part), with one entry per distinct cache of that type. A level
+/// whose caches differ between the cores of one type (a stacked L3 on one core complex
+/// only) gets an entry for each, in the order the threads report them. Instances are
+/// told apart by the APIC-id bits above the sharing span, so `count` and
+/// `threads_sharing` reflect the real topology, and a cache several types share (the
+/// L3 of a hybrid part) is listed once. `None` when a cache does not describe its
+/// sharing (the descriptor leaves).
 pub fn summarize(threads: &[ThreadCaches]) -> Option<Vec<CacheInfo>> {
     let mut list: Vec<CacheInfo> = Vec::new();
-    let mut seen: Vec<&CacheDesc> = Vec::new();
-    let displayed = threads.iter().filter(|t| t.displayed);
-    for desc in displayed.clone().flat_map(|t| &t.caches) {
-        if seen.contains(&desc) {
-            continue;
+    // What is listed so far, with the instances each entry covers.
+    let mut listed: Vec<(&CacheDesc, Vec<u32>)> = Vec::new();
+    let mut sets: Vec<usize> = threads.iter().map(|t| t.core_set).collect();
+    sets.sort_unstable();
+    sets.dedup();
+    for set in sets {
+        let members = threads.iter().filter(move |t| t.core_set == set);
+        let mut seen: Vec<&CacheDesc> = Vec::new();
+        for desc in members.clone().flat_map(|t| &t.caches) {
+            if seen.contains(&desc) {
+                continue;
+            }
+            seen.push(desc);
+            let shift = desc.share_shift?;
+            let instance = |t: &ThreadCaches| t.apic_id.checked_shr(shift).unwrap_or(0);
+            // Threads per instance, counting every thread of the package that sees the same cache.
+            let mut sharers: BTreeMap<u32, u32> = BTreeMap::new();
+            for thread in threads.iter().filter(|t| t.caches.contains(desc)) {
+                *sharers.entry(instance(thread)).or_default() += 1;
+            }
+            // Another core type may own caches of the very same description: only the
+            // instances a thread of this type sits on count, and only their sharers.
+            let mut instances: Vec<u32> =
+                members.clone().filter(|t| t.caches.contains(desc)).map(instance).collect();
+            instances.sort_unstable();
+            instances.dedup();
+            if listed.iter().any(|(other, covered)| *other == desc && *covered == instances) {
+                continue;
+            }
+            let sharing = instances.iter().filter_map(|i| sharers.get(i)).copied().max().unwrap_or(0);
+            list.push(entry(desc, instances.len() as u32, sharing));
+            listed.push((desc, instances));
         }
-        seen.push(desc);
-        let shift = desc.share_shift?;
-        let instance = |t: &ThreadCaches| t.apic_id.checked_shr(shift).unwrap_or(0);
-        // Threads per instance, counting every thread of the package that sees the same cache.
-        let mut sharers: BTreeMap<u32, u32> = BTreeMap::new();
-        for thread in threads.iter().filter(|t| t.caches.contains(desc)) {
-            *sharers.entry(instance(thread)).or_default() += 1;
-        }
-        // Another core type may own caches of the very same description: only the
-        // instances a displayed thread sits on count, and only their sharers.
-        let mut instances: Vec<u32> =
-            displayed.clone().filter(|t| t.caches.contains(desc)).map(instance).collect();
-        instances.sort_unstable();
-        instances.dedup();
-        let sharing = instances.iter().filter_map(|i| sharers.get(i)).copied().max().unwrap_or(0);
-        list.push(entry(desc, instances.len() as u32, sharing));
     }
     sort(&mut list);
     Some(list)
@@ -197,7 +212,7 @@ fn entry(desc: &CacheDesc, count: u32, threads_sharing: u32) -> CacheInfo {
 
 /// Display order: by level, data before instruction before unified. Caches of
 /// one level and kind keep the order they were found in.
-fn sort(list: &mut [CacheInfo]) {
+pub(super) fn sort(list: &mut [CacheInfo]) {
     let rank = |kind| match kind {
         CacheKind::Data => 0,
         CacheKind::Instruction => 1,
@@ -223,8 +238,8 @@ mod tests {
         CacheInfo { level, kind, size_kb, count, ways, line_size: 64, threads_sharing }
     }
 
-    fn thread(apic_id: u32, displayed: bool, table: &[crate::model::CpuidLeaf]) -> ThreadCaches {
-        ThreadCaches { apic_id, displayed, caches: describe(Leaves(table)) }
+    fn thread(apic_id: u32, core_set: usize, table: &[crate::model::CpuidLeaf]) -> ThreadCaches {
+        ThreadCaches { apic_id, core_set, caches: describe(Leaves(table)) }
     }
 
     #[test]
@@ -308,7 +323,7 @@ mod tests {
             ]
         );
         assert!(caches.iter().all(|c| c.share_shift.is_none() && c.max_sharing.is_none()));
-        assert_eq!(summarize(&[ThreadCaches { apic_id: 0, displayed: true, caches }]), None);
+        assert_eq!(summarize(&[ThreadCaches { apic_id: 0, core_set: 0, caches }]), None);
     }
 
     #[test]
@@ -327,7 +342,7 @@ mod tests {
 
     #[test]
     fn counts_instances_on_a_uniform_package() {
-        let threads: Vec<_> = (0..16).map(|apic| thread(apic, true, &zen4(apic))).collect();
+        let threads: Vec<_> = (0..16).map(|apic| thread(apic, 0, &zen4(apic))).collect();
         assert_eq!(
             summarize(&threads).unwrap(),
             [
@@ -343,36 +358,50 @@ mod tests {
     fn counts_real_sharers_not_the_apic_span() {
         // Six cores without SMT whose APIC ids skip every other value: the L1
         // span of two ids holds one thread, the L3 span of sixteen holds six.
-        let threads: Vec<_> = (0..6).map(|core| thread(core * 2, true, &zen4(core * 2))).collect();
+        let threads: Vec<_> = (0..6).map(|core| thread(core * 2, 0, &zen4(core * 2))).collect();
         let list = summarize(&threads).unwrap();
         assert_eq!((list[0].count, list[0].threads_sharing), (6, 1));
         assert_eq!((list[3].count, list[3].threads_sharing), (1, 6));
     }
 
     #[test]
-    fn hybrid_package_shows_the_performance_cores() {
+    fn hybrid_package_lists_every_core_type() {
         // 8 P-cores with two threads each (APIC ids 0,1, 8,9, ...) and 16 E-cores (64, 66, ...).
-        let p = (0..8)
-            .flat_map(|core| [core * 8, core * 8 + 1])
-            .map(|apic| thread(apic, true, &hybrid(apic, true)));
-        let e = (0..16).map(|core| 64 + core * 2).map(|apic| thread(apic, false, &hybrid(apic, false)));
+        let p =
+            (0..8).flat_map(|core| [core * 8, core * 8 + 1]).map(|apic| thread(apic, 0, &hybrid(apic, true)));
+        let e = (0..16).map(|core| 64 + core * 2).map(|apic| thread(apic, 1, &hybrid(apic, false)));
         let threads: Vec<_> = p.chain(e).collect();
         assert_eq!(
             summarize(&threads).unwrap(),
             [
                 info(1, CacheKind::Data, 48, 8, 12, 2),
+                info(1, CacheKind::Data, 32, 16, 8, 1),
                 info(1, CacheKind::Instruction, 32, 8, 8, 2),
+                info(1, CacheKind::Instruction, 64, 16, 8, 1),
                 info(2, CacheKind::Unified, 2048, 8, 16, 2),
-                // The L3 is shared with the E-cores: one instance, all 32 threads.
+                // One L2 per four-core E cluster.
+                info(2, CacheKind::Unified, 4096, 4, 16, 4),
+                // The L3 both types share is listed once: one instance, all 32 threads.
                 info(3, CacheKind::Unified, 36 * 1024, 1, 12, 32),
             ]
         );
     }
 
     #[test]
+    fn core_types_keep_their_display_order() {
+        // The E-cores report first, but the P-cores are the first core set.
+        let p =
+            (0..8).flat_map(|core| [core * 8, core * 8 + 1]).map(|apic| thread(apic, 0, &hybrid(apic, true)));
+        let e = (0..16).map(|core| 64 + core * 2).map(|apic| thread(apic, 1, &hybrid(apic, false)));
+        let threads: Vec<_> = e.chain(p).collect();
+        let sizes: Vec<_> = summarize(&threads).unwrap().iter().map(|c| c.size_kb).collect();
+        assert_eq!(sizes, [48, 32, 32, 64, 2048, 4096, 36 * 1024]);
+    }
+
+    #[test]
     fn lists_every_geometry_of_a_level() {
         // Two core complexes, the first under a stacked 96 MB L3, the second under the plain 32 MB one.
-        let threads: Vec<_> = (0..32).map(|apic| thread(apic, true, &zen4_stacked(apic))).collect();
+        let threads: Vec<_> = (0..32).map(|apic| thread(apic, 0, &zen4_stacked(apic))).collect();
         assert_eq!(
             summarize(&threads).unwrap(),
             [
@@ -384,21 +413,25 @@ mod tests {
             ]
         );
         // Complexes of equal geometry still fold into one entry.
-        let threads: Vec<_> = (0..32).map(|apic| thread(apic, true, &zen4(apic))).collect();
+        let threads: Vec<_> = (0..32).map(|apic| thread(apic, 0, &zen4(apic))).collect();
         let list = summarize(&threads).unwrap();
         assert_eq!(list.len(), 4);
         assert_eq!(list[3], info(3, CacheKind::Unified, 32 * 1024, 2, 16, 16));
     }
 
     #[test]
-    fn sharers_are_counted_on_the_displayed_instances_only() {
+    fn identical_caches_of_two_core_types_are_listed_per_type() {
         // Six P-cores of two threads and two four-core E clusters whose L2 leaves
-        // are identical: 2 MB, 16-way, a sharing span of eight APIC ids.
+        // are identical: 2 MB, 16-way, a sharing span of eight APIC ids. Each type
+        // counts its own instances and the sharers on them.
         let l2 = [leaf(4, 0, 0x0001_C143, 0x03C0_003F, 0x0000_07FF, 0)];
-        let p = (0..6).flat_map(|core| [core * 8, core * 8 + 1]).map(|apic| thread(apic, true, &l2));
-        let e = (0..8).map(|core| thread(64 + core * 2, false, &l2));
+        let p = (0..6).flat_map(|core| [core * 8, core * 8 + 1]).map(|apic| thread(apic, 0, &l2));
+        let e = (0..8).map(|core| thread(64 + core * 2, 1, &l2));
         let threads: Vec<_> = p.chain(e).collect();
-        assert_eq!(summarize(&threads).unwrap(), [info(2, CacheKind::Unified, 2048, 6, 16, 2)]);
+        assert_eq!(
+            summarize(&threads).unwrap(),
+            [info(2, CacheKind::Unified, 2048, 6, 16, 2), info(2, CacheKind::Unified, 2048, 2, 16, 4)]
+        );
     }
 
     #[test]

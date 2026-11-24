@@ -1,10 +1,11 @@
 //! Device handles for information requests.
 
 use windows::core::{Owned, HSTRING};
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{BOOL, GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+use windows::Win32::System::Power::GetDevicePowerState;
 use windows::Win32::System::IO::DeviceIoControl;
 
 /// A device opened for control requests only, closed on drop.
@@ -30,6 +31,32 @@ impl DeviceHandle {
             .ok()
             .map(|handle| DeviceHandle(Owned::new(handle)))
         }
+    }
+
+    /// Opens a device for reading and writing, as a driver that takes requests through
+    /// its own control codes wants it. The error tells a missing device from a refusal.
+    pub fn open_read_write(path: &str) -> windows::core::Result<DeviceHandle> {
+        // SAFETY: as in `open`.
+        unsafe {
+            CreateFileW(
+                &HSTRING::from(path),
+                (GENERIC_READ | GENERIC_WRITE).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                HANDLE::default(),
+            )
+            .map(|handle| DeviceHandle(Owned::new(handle)))
+        }
+    }
+
+    /// Whether the device is in its working power state; `None` when Windows cannot tell.
+    /// Asking does not wake a device that sleeps.
+    pub fn is_awake(&self) -> Option<bool> {
+        let mut on = BOOL::default();
+        // SAFETY: the handle is open and `on` is a live BOOL the call writes to.
+        unsafe { GetDevicePowerState(*self.0, &mut on) }.as_bool().then_some(on.as_bool())
     }
 
     /// Sends a control request with `input` and returns what the driver answered, at

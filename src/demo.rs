@@ -35,6 +35,7 @@ pub fn system() -> SystemInfo {
         technology_nm: Some(5),
         max_tdp_w: Some(65.0),
         core_voltage: Some(1.016),
+        ratio_range: None,
         family: 0xF,
         model: 0x1,
         stepping: 0x2,
@@ -311,6 +312,7 @@ pub fn system() -> SystemInfo {
             solid_state: true,
             bus_type: Some(17),
             features: vec!["SMART".into()],
+            health: None,
             controller: Some(DriveController {
                 name: "NVM Express (NVMe) Controller".into(),
                 bus: 2,
@@ -341,6 +343,7 @@ pub fn system() -> SystemInfo {
             solid_state: false,
             bus_type: Some(11),
             features: vec!["SMART".into()],
+            health: None,
             controller: Some(DriveController {
                 name: "Serial ATA Controller - AHCI".into(),
                 bus: 3,
@@ -392,6 +395,9 @@ pub fn system() -> SystemInfo {
             TimerFrequency { name: "Perf timer".into(), hz: 10_000_000.0 },
             TimerFrequency { name: "Sys timer".into(), hz: 1_000.0 },
         ],
+        sensors: Vec::new(),
+        notes: Vec::new(),
+        access: AccessInfo::default(),
     }
 }
 

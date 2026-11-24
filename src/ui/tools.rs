@@ -18,12 +18,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::Config;
 use crate::hw::timers::{TimerSet, TIMER_COUNT};
-use crate::model::ClockSnapshot;
+use crate::model::{ClockSnapshot, Sensor};
 
 use super::format;
 use super::gdi::{Align, FontId, Painter};
 use super::geom::{contains, dlu, height, width, Dlu, Scale};
-use super::layout::{clocks_tool, timers_tool, tool_close_box, TOOL_TITLE_HEIGHT};
+use super::layout::{clocks_tool, sensors_tool, timers_tool, tool_close_box, TOOL_TITLE_HEIGHT};
 use super::render;
 use super::theme::Theme;
 use super::widgets::{self, Glyph, Mood};
@@ -336,7 +336,11 @@ pub fn open<T: Tool>(owner: HWND, cfg: &Config, tool: T) -> Option<HWND> {
         Some(owner),
         window,
     )?;
-    let (x, y) = win::centred_in(win::window_rect(owner), window_width, window_height);
+    // Centred over the owner, but never off the owner's monitor.
+    let over = win::window_rect(owner);
+    let area = win::work_area_near(over).unwrap_or(over);
+    let (x, y) =
+        win::kept_in(area, win::centred_in(over, window_width, window_height), window_width, window_height);
     win::place(hwnd, x, y, window_width, window_height);
     win::show(hwnd);
     Some(hwnd)
@@ -394,54 +398,78 @@ impl ClocksTool {
     }
 }
 
+/// Column titles and widths of a three-column table.
+type Columns = [(&'static str, i32); 3];
+
 /// Horizontal pixel spans of the text in the three table columns.
-fn column_spans(scale: Scale) -> [(i32, i32); 3] {
+fn column_spans(scale: Scale, columns: &Columns) -> [(i32, i32); 3] {
     let pad = scale.px(6);
     let mut left = body(clocks_tool::TABLE).x;
-    clocks_tool::COLUMNS.map(|(_, column_width)| {
+    columns.map(|(_, column_width)| {
         let span = (scale.x(left) + pad, scale.x(left + column_width) - pad);
         left += column_width;
         span
     })
 }
 
-impl ClocksTool {
-    /// Header band with the column titles, and the lines between the columns.
-    fn draw_header(p: &Painter, frame: RECT, header_bottom: i32) {
-        let t = p.theme;
-        let line = p.hairline();
-        let band = RECT {
-            left: frame.left + line,
-            top: frame.top + line,
-            right: frame.right - line,
-            bottom: header_bottom,
-        };
-        p.fill(band, t.control);
-        p.fill(RECT { top: header_bottom, bottom: header_bottom + line, ..frame }, t.frame);
-        let pad = p.scale.px(6);
-        for ((title, _), (left, right)) in clocks_tool::COLUMNS.into_iter().zip(column_spans(p.scale)) {
-            widgets::note(p, RECT { left, right, ..band }, title, Align::Left);
-            let separator = left - pad;
-            if separator > frame.left {
-                p.fill(RECT { left: separator, right: separator + line, ..frame }, t.frame);
-            }
+/// Draws a scrolling table: frame, header, the rows from `top` on and the scroll bar.
+fn draw_table(p: &Painter, columns: &Columns, rows: &[[String; 3]], top: usize) {
+    let table = body(clocks_tool::TABLE);
+    let frame = p.scale.rect(table);
+    let header_bottom = p.scale.y(table.y + clocks_tool::HEADER_HEIGHT);
+    p.panel(frame, p.theme.panel, p.theme.frame);
+    draw_header(p, columns, frame, header_bottom);
+    draw_rows(p, columns, rows, top);
+    let line = p.hairline();
+    let track = RECT {
+        left: frame.right - line - p.scale.px(widgets::SCROLL_BAR),
+        top: header_bottom + line,
+        right: frame.right - line,
+        bottom: frame.bottom - line,
+    };
+    widgets::scroll_bar(p, track, top, clocks_tool::visible_rows(), rows.len());
+}
+
+/// The scroll position `rows` away from `top`, kept inside a table of `len` rows.
+fn scrolled(top: usize, rows: isize, len: usize) -> usize {
+    top.saturating_add_signed(rows).min(len.saturating_sub(clocks_tool::visible_rows()))
+}
+
+/// Header band with the column titles, and the lines between the columns.
+fn draw_header(p: &Painter, columns: &Columns, frame: RECT, header_bottom: i32) {
+    let t = p.theme;
+    let line = p.hairline();
+    let band = RECT {
+        left: frame.left + line,
+        top: frame.top + line,
+        right: frame.right - line,
+        bottom: header_bottom,
+    };
+    p.fill(band, t.control);
+    p.fill(RECT { top: header_bottom, bottom: header_bottom + line, ..frame }, t.frame);
+    let pad = p.scale.px(6);
+    for ((title, _), (left, right)) in columns.iter().zip(column_spans(p.scale, columns)) {
+        widgets::note(p, RECT { left, right, ..band }, title, Align::Left);
+        let separator = left - pad;
+        if separator > frame.left {
+            p.fill(RECT { left: separator, right: separator + line, ..frame }, t.frame);
         }
     }
+}
 
-    /// The visible rows: device names in the label colour, readings in the value colour.
-    fn draw_rows(&self, p: &Painter) {
-        let first = body(clocks_tool::TABLE).y + clocks_tool::HEADER_HEIGHT + 1;
-        let spans = column_spans(p.scale);
-        for (slot, row) in self.rows.iter().skip(self.top).take(clocks_tool::visible_rows()).enumerate() {
-            let top = p.scale.y(first + clocks_tool::ROW_HEIGHT * slot as i32);
-            let bottom = p.scale.y(first + clocks_tool::ROW_HEIGHT * (slot as i32 + 1));
-            for (index, (text, (left, right))) in row.iter().zip(spans).enumerate() {
-                let cell = RECT { left, top, right, bottom };
-                if index == 0 {
-                    widgets::note(p, cell, text, Align::Left);
-                } else {
-                    widgets::plain_value(p, cell, text, Align::Left);
-                }
+/// The visible rows: names in the label colour, readings in the value colour.
+fn draw_rows(p: &Painter, columns: &Columns, rows: &[[String; 3]], top: usize) {
+    let first = body(clocks_tool::TABLE).y + clocks_tool::HEADER_HEIGHT + 1;
+    let spans = column_spans(p.scale, columns);
+    for (slot, row) in rows.iter().skip(top).take(clocks_tool::visible_rows()).enumerate() {
+        let top = p.scale.y(first + clocks_tool::ROW_HEIGHT * slot as i32);
+        let bottom = p.scale.y(first + clocks_tool::ROW_HEIGHT * (slot as i32 + 1));
+        for (index, (text, (left, right))) in row.iter().zip(spans).enumerate() {
+            let cell = RECT { left, top, right, bottom };
+            if index == 0 {
+                widgets::note(p, cell, text, Align::Left);
+            } else {
+                widgets::plain_value(p, cell, text, Align::Left);
             }
         }
     }
@@ -466,7 +494,7 @@ impl Tool for ClocksTool {
     }
 
     fn scroll(&mut self, rows: isize) -> bool {
-        let top = self.top.saturating_add_signed(rows).min(self.max_top());
+        let top = scrolled(self.top, rows, self.rows.len());
         let changed = top != self.top;
         self.top = top;
         changed
@@ -477,20 +505,7 @@ impl Tool for ClocksTool {
     }
 
     fn draw(&self, p: &Painter) {
-        let table = body(clocks_tool::TABLE);
-        let frame = p.scale.rect(table);
-        let header_bottom = p.scale.y(table.y + clocks_tool::HEADER_HEIGHT);
-        p.panel(frame, p.theme.panel, p.theme.frame);
-        Self::draw_header(p, frame, header_bottom);
-        self.draw_rows(p);
-        let line = p.hairline();
-        let track = RECT {
-            left: frame.right - line - p.scale.px(widgets::SCROLL_BAR),
-            top: header_bottom + line,
-            right: frame.right - line,
-            bottom: frame.bottom - line,
-        };
-        widgets::scroll_bar(p, track, self.top, clocks_tool::visible_rows(), self.rows.len());
+        draw_table(p, &clocks_tool::COLUMNS, &self.rows, self.top);
     }
 }
 
@@ -500,6 +515,102 @@ pub fn update_clocks(hwnd: HWND, clocks: &ClockSnapshot) {
     // window reports its destruction, so its state is a `ToolWindow<ClocksTool>`.
     let updated =
         unsafe { win::with_state(hwnd, |window: &mut ToolWindow<ClocksTool>| window.tool.refresh(clocks)) };
+    if updated.is_some() {
+        win::invalidate(hwnd);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sensors
+// ---------------------------------------------------------------------------
+
+/// The Sensors tool: a live table of every sensor with its reading and the highest
+/// reading since the window opened.
+pub struct SensorsTool {
+    rows: Vec<[String; 3]>,
+    /// The highest reading of each sensor so far, by group and name.
+    highest: Vec<Sensor>,
+    /// Index of the first visible row.
+    top: usize,
+}
+
+impl SensorsTool {
+    pub fn new(sensors: &[Sensor]) -> Self {
+        let mut tool = SensorsTool { rows: Vec::new(), highest: Vec::new(), top: 0 };
+        tool.refresh(sensors);
+        tool
+    }
+
+    /// Takes a fresh reading of every sensor, keeping the scroll position where possible.
+    fn refresh(&mut self, sensors: &[Sensor]) {
+        for sensor in sensors {
+            let same = |known: &&mut Sensor| known.group == sensor.group && known.name == sensor.name;
+            match self.highest.iter_mut().find(same) {
+                Some(known) => known.value = known.value.max(sensor.value),
+                None => self.highest.push(sensor.clone()),
+            }
+        }
+        self.rows = sensors
+            .iter()
+            .map(|sensor| {
+                let highest = self
+                    .highest
+                    .iter()
+                    .find(|known| known.group == sensor.group && known.name == sensor.name);
+                [
+                    format!("{} {}", sensor.group, sensor.name),
+                    sensor.value_text(),
+                    highest.map(Sensor::value_text).unwrap_or_default(),
+                ]
+            })
+            .collect();
+        if self.rows.is_empty() {
+            self.rows.push(["No sensor readings".to_string(), String::new(), String::new()]);
+        }
+        self.top = scrolled(self.top, 0, self.rows.len());
+    }
+}
+
+impl Tool for SensorsTool {
+    const CLASS: PCWSTR = w!("RsCpuzSensors");
+    const TITLE: &'static str = "Sensors";
+    const SIZE: (i32, i32) = sensors_tool::SIZE;
+    const CODE: usize = 3;
+
+    fn buttons(&self) -> Vec<(Dlu, &'static str)> {
+        vec![(sensors_tool::OK, "OK")]
+    }
+
+    fn default_button(&self) -> usize {
+        0
+    }
+
+    fn press(&mut self, _button: usize) -> Response {
+        Response::Close
+    }
+
+    fn scroll(&mut self, rows: isize) -> bool {
+        let top = scrolled(self.top, rows, self.rows.len());
+        let changed = top != self.top;
+        self.top = top;
+        changed
+    }
+
+    fn page_rows(&self) -> isize {
+        clocks_tool::visible_rows() as isize
+    }
+
+    fn draw(&self, p: &Painter) {
+        draw_table(p, &sensors_tool::COLUMNS, &self.rows, self.top);
+    }
+}
+
+/// Feeds a fresh sensor reading to an open Sensors window.
+pub fn update_sensors(hwnd: HWND, sensors: &[Sensor]) {
+    // SAFETY: `hwnd` was returned by `open::<SensorsTool>` and the owner forgets it when the
+    // window reports its destruction, so its state is a `ToolWindow<SensorsTool>`.
+    let updated =
+        unsafe { win::with_state(hwnd, |window: &mut ToolWindow<SensorsTool>| window.tool.refresh(sensors)) };
     if updated.is_some() {
         win::invalidate(hwnd);
     }
@@ -587,7 +698,7 @@ mod tests {
 
     use super::*;
     use crate::demo;
-    use crate::model::{CoreClock, CoreKind};
+    use crate::model::{CoreClock, CoreKind, SensorKind};
 
     #[test]
     fn clock_table_lists_the_bus_and_every_core() {
@@ -612,6 +723,28 @@ mod tests {
         assert_eq!(rows[1], ["P-Core #0", "5000.00 MHz", ""]);
         assert_eq!(rows[2], ["E-Core #8", "3900.00 MHz", "x 39.00"]);
         assert_eq!(clock_rows(&ClockSnapshot::default()).len(), 1);
+    }
+
+    #[test]
+    fn sensor_table_lists_readings_and_the_highest_seen() {
+        let sensor = |group: &str, name: &str, kind, value| Sensor {
+            group: group.into(),
+            name: name.into(),
+            kind,
+            value,
+        };
+        let mut tool = SensorsTool::new(&[
+            sensor("CPU", "Package", SensorKind::Power, 21.5),
+            sensor("ACPI", "TZ00", SensorKind::Temperature, 56.05),
+        ]);
+        assert_eq!(tool.rows, [["CPU Package", "21.50 W", "21.50 W"], ["ACPI TZ00", "56.0 °C", "56.0 °C"]]);
+        tool.refresh(&[
+            sensor("CPU", "Package", SensorKind::Power, 30.0),
+            sensor("ACPI", "TZ00", SensorKind::Temperature, 50.0),
+        ]);
+        assert_eq!(tool.rows, [["CPU Package", "30.00 W", "30.00 W"], ["ACPI TZ00", "50.0 °C", "56.0 °C"]]);
+        assert_eq!(SensorsTool::new(&[]).rows, [["No sensor readings", "", ""]]);
+        assert_eq!(tool.press(0), Response::Close);
     }
 
     #[test]

@@ -58,8 +58,45 @@ impl ListId {
     }
 }
 
-/// Entries of the "Tools" menu, in display order.
-pub const TOOLS_MENU: [&str; 4] = ["Save Report (.TXT)...", "Save Report (.HTML)...", "Clocks", "Timers"];
+/// What an entry of the "Tools" menu does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolsEntry {
+    SaveTxt,
+    SaveHtml,
+    Clocks,
+    Timers,
+    Sensors,
+    RestartAsAdmin,
+}
+
+impl ToolsEntry {
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolsEntry::SaveTxt => "Save Report (.TXT)...",
+            ToolsEntry::SaveHtml => "Save Report (.HTML)...",
+            ToolsEntry::Clocks => "Clocks",
+            ToolsEntry::Timers => "Timers",
+            ToolsEntry::Sensors => "Sensors",
+            ToolsEntry::RestartAsAdmin => "Restart as Administrator",
+        }
+    }
+}
+
+/// Entries of the "Tools" menu, in display order. `offer_admin` adds the entry that
+/// restarts the program with administrator rights.
+pub fn tools_menu(offer_admin: bool) -> Vec<ToolsEntry> {
+    let mut entries = vec![
+        ToolsEntry::SaveTxt,
+        ToolsEntry::SaveHtml,
+        ToolsEntry::Clocks,
+        ToolsEntry::Timers,
+        ToolsEntry::Sensors,
+    ];
+    if offer_admin {
+        entries.push(ToolsEntry::RestartAsAdmin);
+    }
+    entries
+}
 
 /// First entry of the reference selector, shown while no reference is chosen.
 pub const NO_REFERENCE: &str = "<Please Select>";
@@ -243,6 +280,8 @@ pub struct UiState {
     pub slot: usize,
     pub gpu: usize,
     pub perf_level: usize,
+    /// The Tools menu offers to restart with administrator rights.
+    pub offer_admin: bool,
     pub bench: BenchState,
 }
 
@@ -260,6 +299,7 @@ impl UiState {
             slot: sys.modules.iter().position(|module| module.populated).unwrap_or(0),
             gpu,
             perf_level: sys.gpus.get(gpu).map_or(0, GpuInfo::current_perf_level),
+            offer_admin: false,
             bench: BenchState::new(max_threads, references),
         }
     }
@@ -321,7 +361,9 @@ impl<'a> View<'a> {
             ListId::Reference => std::iter::once(NO_REFERENCE.to_string())
                 .chain(self.ui.bench.references.iter().map(|r| r.name.clone()))
                 .collect(),
-            ListId::ToolsMenu => TOOLS_MENU.iter().map(|s| s.to_string()).collect(),
+            ListId::ToolsMenu => {
+                tools_menu(self.ui.offer_admin).into_iter().map(|entry| entry.label().to_string()).collect()
+            }
             ListId::CoreMenu => {
                 self.clocks.cores.iter().map(|clock| format::core_label(clock.kind, clock.core)).collect()
             }
@@ -457,7 +499,12 @@ mod tests {
         assert_eq!(view.list_text(ListId::Threads), "16 threads");
         assert_eq!(view.list_text(ListId::Reference), NO_REFERENCE);
         assert_eq!(view.list_selection(ListId::ToolsMenu), None);
-        assert_eq!(view.list_items(ListId::ToolsMenu).len(), TOOLS_MENU.len());
+        assert_eq!(
+            view.list_items(ListId::ToolsMenu),
+            ["Save Report (.TXT)...", "Save Report (.HTML)...", "Clocks", "Timers", "Sensors"]
+        );
+        assert_eq!(tools_menu(true).last(), Some(&ToolsEntry::RestartAsAdmin));
+        assert_eq!(ToolsEntry::RestartAsAdmin.label(), "Restart as Administrator");
     }
 
     #[test]

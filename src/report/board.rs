@@ -1,6 +1,6 @@
 //! Mainboard sections: BIOS, chipset and the memory modules.
 
-use crate::model::{self, MainboardInfo, MemoryInfo, MemoryModule, TimingProfile};
+use crate::model::{self, MainboardInfo, MemoryInfo, MemoryModule, Sensor, TimingProfile};
 
 use super::doc::{Lines, Section};
 use super::fmt;
@@ -42,7 +42,7 @@ pub(super) fn chipset(board: &MainboardInfo, memory: &MemoryInfo) -> Section {
     out.opt(0, "Cycle Time (tRAS)", timings.tras);
     out.opt(0, "Bank Cycle Time (tRC)", timings.trc);
     out.opt(0, "Command Rate (CR)", timings.command_rate.as_deref());
-    out.opt(0, "Memory Controller Frequency", memory.controller_mhz.map(|mhz| format!("{mhz:.1} MHz")));
+    out.opt(0, "Uncore Frequency", memory.controller_mhz.map(|mhz| format!("{mhz:.1} MHz")));
     out.blank();
     out.into_section("Chipset")
 }
@@ -75,11 +75,26 @@ pub(super) fn spd(modules: &[MemoryModule]) -> Section {
     out.into_section("Memory SPD")
 }
 
-/// "Monitoring": the board whose sensors a monitoring tool would read. The sensors
-/// themselves sit behind port I/O and are out of reach.
-pub(super) fn monitoring(board: &MainboardInfo) -> Section {
+/// "Monitoring": the board whose sensors a monitoring tool would read, then every sensor
+/// detection read, grouped by what it belongs to.
+pub(super) fn monitoring(board: &MainboardInfo, sensors: &[Sensor]) -> Section {
     let mut out = Lines::default();
     out.short("Mainboard Model", 2, &board.model);
+    let mut groups: Vec<&str> = Vec::new();
+    for sensor in sensors {
+        if !groups.contains(&sensor.group.as_str()) {
+            groups.push(&sensor.group);
+        }
+    }
+    if !groups.is_empty() {
+        out.blank();
+    }
+    for group in groups {
+        out.short("Hardware monitor", 1, group);
+        for sensor in sensors.iter().filter(|sensor| sensor.group == group) {
+            out.pair(1, &sensor.name, sensor.value_text());
+        }
+    }
     out.into_section("Monitoring")
 }
 
@@ -159,7 +174,7 @@ fn timing_row(profile: &TimingProfile, with_rate: bool, with_voltage: bool) -> S
 mod tests {
     use super::*;
     use crate::demo;
-    use crate::model::{BiosInfo, MemoryTimings};
+    use crate::model::{BiosInfo, MemoryTimings, SensorKind};
     use crate::report::txt::lines_of;
 
     fn profile(name: &str, mhz: f64) -> TimingProfile {
@@ -207,7 +222,7 @@ mod tests {
                 "Cycle Time (tRAS)\t\t84",
                 "Bank Cycle Time (tRC)\t\t125",
                 "Command Rate (CR)\t\t1T",
-                "Memory Controller Frequency\t2600.1 MHz",
+                "Uncore Frequency\t\t2600.1 MHz",
                 "",
             ]
         );
@@ -268,10 +283,42 @@ mod tests {
     #[test]
     fn names_the_board_for_monitoring() {
         assert_eq!(
-            lines_of(&monitoring(&demo::system().mainboard)),
+            lines_of(&monitoring(&demo::system().mainboard, &[])),
             ["Mainboard Model\t\tB650 EXAMPLE WIFI"]
         );
-        assert!(lines_of(&monitoring(&MainboardInfo::default())).is_empty());
+        assert!(lines_of(&monitoring(&MainboardInfo::default(), &[])).is_empty());
+    }
+
+    #[test]
+    fn lists_the_sensors_by_what_they_belong_to() {
+        let sensor = |group: &str, name: &str, kind, value| Sensor {
+            group: group.into(),
+            name: name.into(),
+            kind,
+            value,
+        };
+        let sensors = [
+            sensor("CPU", "Package", SensorKind::Power, 21.5),
+            sensor("CPU", "Cores", SensorKind::Power, 14.6),
+            sensor("ACPI", "TZ00", SensorKind::Temperature, 56.05),
+        ];
+        let board = MainboardInfo { model: "0XD433".into(), ..MainboardInfo::default() };
+        let lines: Vec<String> = lines_of(&monitoring(&board, &sensors))
+            .iter()
+            .map(|line| line.split('\t').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("|"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Mainboard Model|0XD433",
+                "",
+                "Hardware monitor|CPU",
+                "Package|21.50 W",
+                "Cores|14.60 W",
+                "Hardware monitor|ACPI",
+                "TZ00|56.0 °C",
+            ]
+        );
     }
 
     #[test]

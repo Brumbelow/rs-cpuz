@@ -2,8 +2,10 @@
 //!
 //! Every present disk is opened through its device interface without read or write
 //! access, which takes no elevation, and asked the property queries Windows documents
-//! for storage devices. The device tree leads from a disk to the controller it is
-//! attached to, and the mounted volumes say which disks they lie on.
+//! for storage devices. A disk that sleeps is asked only what Windows keeps of it, so
+//! that neither detection nor the Sensors window spins it up. The device tree leads from
+//! a disk to the controller it is attached to, and the mounted volumes say which disks
+//! they lie on.
 
 use windows::core::HSTRING;
 use windows::Win32::Storage::FileSystem::{
@@ -13,18 +15,19 @@ use windows::Win32::System::Diagnostics::Debug::{
     SetThreadErrorMode, SEM_FAILCRITICALERRORS, THREAD_ERROR_MODE,
 };
 use windows::Win32::System::Ioctl::{
-    AtaDataTypeIdentify, NVMeDataTypeIdentify, NVMeDataTypeLogPage, PropertyStandardQuery, ProtocolTypeAta,
-    ProtocolTypeNvme, StorageAdapterProtocolSpecificProperty, StorageDeviceProperty,
-    StorageDeviceProtocolSpecificProperty, StorageDeviceSeekPenaltyProperty, GUID_DEVINTERFACE_DISK,
-    IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_PREDICT_FAILURE,
-    IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_ID,
+    AtaDataTypeIdentify, AtaDataTypeLogPage, NVMeDataTypeIdentify, NVMeDataTypeLogPage,
+    PropertyStandardQuery, ProtocolTypeAta, ProtocolTypeNvme, StorageAdapterProtocolSpecificProperty,
+    StorageDeviceProperty, StorageDeviceProtocolSpecificProperty, StorageDeviceSeekPenaltyProperty,
+    StorageDeviceTemperatureProperty, GUID_DEVINTERFACE_DISK, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+    IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_PREDICT_FAILURE, IOCTL_STORAGE_QUERY_PROPERTY,
+    STORAGE_PROPERTY_ID,
 };
 use windows::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE};
 
 use super::ioctl::DeviceHandle;
 use super::pci;
 use super::setup::{InterfaceSet, Node};
-use crate::model::{DriveController, DriveInfo, PciDevice, VolumeInfo};
+use crate::model::{DriveController, DriveHealth, DriveInfo, PciDevice, VolumeInfo};
 
 /// Bus types (`STORAGE_BUS_TYPE`) whose drives answer queries of their own protocol.
 const BUS_ATA: u32 = 3;
@@ -51,6 +54,14 @@ const GEOMETRY_CAPACITY: usize = 256;
 const GEOMETRY_DISK_SIZE: usize = 24;
 /// Size of a `STORAGE_PREDICT_FAILURE`.
 const PREDICT_FAILURE_LEN: usize = 516;
+/// Room for a `STORAGE_TEMPERATURE_DATA_DESCRIPTOR` with a few sensors: its fixed part,
+/// where the sensor count sits at offset 12, then 16 bytes per sensor.
+const TEMPERATURE_CAPACITY: usize = 256;
+const TEMPERATURE_HEADER_LEN: usize = 24;
+/// Readings outside this range (degrees Celsius) are no measurement.
+const PLAUSIBLE_CELSIUS: std::ops::RangeInclusive<f32> = -40.0..=150.0;
+/// An NVMe data unit: a thousand 512-byte sectors.
+const NVME_DATA_UNIT: u128 = 512_000;
 
 /// Layout of a `VOLUME_DISK_EXTENTS`: a count, then one `DISK_EXTENT` per extent
 /// that starts with the number of its disk.
@@ -79,6 +90,15 @@ const NVME_SERIAL: std::ops::Range<usize> = 4..24;
 
 /// Size of the ATA `IDENTIFY DEVICE` data, 256 words.
 const ATA_IDENTIFY_LEN: usize = 512;
+/// Identify word 106 (physical / logical sector size) and words 117-118 (logical sector size in words).
+const ATA_SECTOR_SIZE: usize = 106;
+const ATA_LOGICAL_SECTOR_WORDS: usize = 117;
+/// The device statistics log, and the pages of it read here: general statistics (power
+/// cycles, power-on hours, sectors read and written), general errors, temperature, and
+/// the endurance of a solid state drive. Each page is one 512-byte log page.
+const ATA_LOG_DEVICE_STATISTICS: u32 = 0x04;
+const ATA_STATISTICS_PAGES: [u32; 4] = [0x01, 0x04, 0x05, 0x07];
+const ATA_LOG_PAGE_LEN: usize = 512;
 /// The words of it that list the supported command sets.
 const ATA_COMMAND_SETS_1: usize = 82;
 const ATA_COMMAND_SETS_2: usize = 83;
@@ -142,20 +162,34 @@ fn query(path: &str) -> Option<DriveInfo> {
     let descriptor = property(StorageDeviceProperty, DEVICE_DESCRIPTOR_CAPACITY)
         .and_then(|answer| parse_device_descriptor(&answer))
         .unwrap_or_default();
+    // The descriptor, number, geometry and seek penalty come from what Windows keeps. The
+    // identification, health and temperature come from the drive itself, which is asked
+    // for them only while it is awake.
+    let ask = asks_the_drive(disk.is_awake());
     // For an NVMe drive Windows passes off a generated identifier as the serial number;
     // the one the manufacturer gave it is in the controller identification.
-    let nvme_serial = (descriptor.bus_type == Some(BUS_NVME))
+    let nvme_serial = (ask && descriptor.bus_type == Some(BUS_NVME))
         .then(|| {
             let identify = ProtocolQuery {
                 property: StorageAdapterProtocolSpecificProperty,
                 protocol: ProtocolTypeNvme.0 as u32,
                 data_type: NVMeDataTypeIdentify.0 as u32,
                 request: NVME_IDENTIFY_CONTROLLER,
+                sub_request: 0,
                 length: NVME_IDENTIFY_LEN,
             };
             identify.send(&disk).and_then(|data| text(data.get(NVME_SERIAL)?))
         })
         .flatten();
+    let (smart, mut health) = if ask { health_records(&disk, descriptor.bus_type) } else { (false, None) };
+    // The drive's own temperature report, where Windows has one, holds for every bus.
+    if let Some(celsius) = ask
+        .then(|| property(StorageDeviceTemperatureProperty, TEMPERATURE_CAPACITY))
+        .flatten()
+        .and_then(|answer| parse_temperature(&answer))
+    {
+        health.get_or_insert_with(DriveHealth::default).temperature_c = Some(celsius);
+    }
     let no_seek_penalty = property(StorageDeviceSeekPenaltyProperty, SEEK_PENALTY_LEN)
         .and_then(|answer| parse_seek_penalty(&answer))
         == Some(false);
@@ -172,42 +206,174 @@ fn query(path: &str) -> Option<DriveInfo> {
         removable: descriptor.removable,
         solid_state: no_seek_penalty,
         bus_type: descriptor.bus_type,
-        features: if predicts_failure(&disk, descriptor.bus_type) {
-            vec![FEATURE_SMART.to_string()]
-        } else {
-            Vec::new()
-        },
+        features: if smart { vec![FEATURE_SMART.to_string()] } else { Vec::new() },
+        health,
         controller: None,
         volumes: Vec::new(),
     })
 }
 
-/// Whether the drive keeps the health records known as SMART. An NVMe drive is asked
-/// for its health log and an ATA drive for the command sets it supports; any drive may
-/// answer the failure prediction request of Windows instead.
-fn predicts_failure(disk: &DeviceHandle, bus_type: Option<u32>) -> bool {
-    let by_protocol = match bus_type {
-        Some(BUS_NVME) => ProtocolQuery {
-            property: StorageDeviceProtocolSpecificProperty,
-            protocol: ProtocolTypeNvme.0 as u32,
-            data_type: NVMeDataTypeLogPage.0 as u32,
-            request: NVME_LOG_HEALTH,
-            length: NVME_HEALTH_LEN,
+/// The current temperature of the drive behind `path`, in degrees Celsius: from the
+/// storage temperature query, or from the health log of an NVMe drive. `None` while the
+/// disk sleeps: reading it every second would wake it up and keep it awake.
+pub fn temperature(path: &str, bus_type: Option<u32>) -> Option<f32> {
+    let disk = DeviceHandle::open(path)?;
+    if !asks_the_drive(disk.is_awake()) {
+        return None;
+    }
+    let reported = disk
+        .control(
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &property_query(StorageDeviceTemperatureProperty),
+            TEMPERATURE_CAPACITY,
+        )
+        .and_then(|answer| parse_temperature(&answer));
+    reported.or_else(|| health_records(&disk, bus_type).1?.temperature_c)
+}
+
+/// Whether a disk in power state `awake` (as [`DeviceHandle::is_awake`] tells it) is sent
+/// requests the drive itself answers. A disk that sleeps would spin up for them, which
+/// takes seconds; one that cannot tell its state is asked.
+fn asks_the_drive(awake: Option<bool>) -> bool {
+    awake != Some(false)
+}
+
+/// What the drive keeps of its health: whether it keeps the records known as SMART,
+/// and those of them it hands out. An NVMe drive is asked for its health log and an ATA
+/// drive for the command sets it supports and its statistics; any drive may answer the
+/// failure prediction request of Windows instead. Only for a disk that is awake.
+fn health_records(disk: &DeviceHandle, bus_type: Option<u32>) -> (bool, Option<DriveHealth>) {
+    let (by_protocol, health) = match bus_type {
+        Some(BUS_NVME) => {
+            let log = ProtocolQuery {
+                property: StorageDeviceProtocolSpecificProperty,
+                protocol: ProtocolTypeNvme.0 as u32,
+                data_type: NVMeDataTypeLogPage.0 as u32,
+                request: NVME_LOG_HEALTH,
+                sub_request: 0,
+                length: NVME_HEALTH_LEN,
+            }
+            .send(disk)
+            .filter(|log| log.len() == NVME_HEALTH_LEN);
+            (log.is_some(), log.as_deref().and_then(parse_nvme_health))
         }
-        .send(disk)
-        .is_some_and(|log| log.len() == NVME_HEALTH_LEN),
-        Some(BUS_ATA | BUS_SATA) => ProtocolQuery {
-            property: StorageDeviceProtocolSpecificProperty,
-            protocol: ProtocolTypeAta.0 as u32,
-            data_type: AtaDataTypeIdentify.0 as u32,
-            request: 0,
-            length: ATA_IDENTIFY_LEN,
+        Some(BUS_ATA | BUS_SATA) => {
+            let identify = ProtocolQuery {
+                property: StorageDeviceProtocolSpecificProperty,
+                protocol: ProtocolTypeAta.0 as u32,
+                data_type: AtaDataTypeIdentify.0 as u32,
+                request: 0,
+                sub_request: 0,
+                length: ATA_IDENTIFY_LEN,
+            }
+            .send(disk);
+            let smart =
+                identify.as_deref().is_some_and(|identify| ata_supports_smart(identify) == Some(true));
+            let pages: Vec<Vec<u8>> = ATA_STATISTICS_PAGES
+                .iter()
+                .filter_map(|&page| {
+                    ProtocolQuery {
+                        property: StorageDeviceProtocolSpecificProperty,
+                        protocol: ProtocolTypeAta.0 as u32,
+                        data_type: AtaDataTypeLogPage.0 as u32,
+                        request: ATA_LOG_DEVICE_STATISTICS,
+                        sub_request: page,
+                        length: ATA_LOG_PAGE_LEN,
+                    }
+                    .send(disk)
+                })
+                .collect();
+            let sector_bytes = identify.as_deref().map_or(512, logical_sector_bytes);
+            (smart, parse_ata_statistics(&pages, sector_bytes))
         }
-        .send(disk)
-        .is_some_and(|identify| ata_supports_smart(&identify) == Some(true)),
-        _ => false,
+        _ => (false, None),
     };
-    by_protocol || disk.control(IOCTL_STORAGE_PREDICT_FAILURE, &[], PREDICT_FAILURE_LEN).is_some()
+    let smart =
+        by_protocol || disk.control(IOCTL_STORAGE_PREDICT_FAILURE, &[], PREDICT_FAILURE_LEN).is_some();
+    (smart, health)
+}
+
+/// Decodes an NVMe SMART / health information log page (log identifier 02h). `None`
+/// when the page is too short to hold the counters.
+fn parse_nvme_health(log: &[u8]) -> Option<DriveHealth> {
+    let counter = |offset: usize| -> Option<u128> {
+        let bytes: [u8; 16] = log.get(offset..offset + 16)?.try_into().ok()?;
+        Some(u128::from_le_bytes(bytes))
+    };
+    let count = |offset| counter(offset).map(|value| u64::try_from(value).unwrap_or(u64::MAX));
+    let data = |offset| counter(offset).map(|units| units.saturating_mul(NVME_DATA_UNIT));
+    let kelvin = u16::from_le_bytes([*log.get(1)?, *log.get(2)?]);
+    Some(DriveHealth {
+        // The composite temperature is in kelvin; zero means the drive does not report it.
+        temperature_c: (kelvin != 0)
+            .then(|| f32::from(kelvin) - 273.0)
+            .filter(|c| PLAUSIBLE_CELSIUS.contains(c)),
+        available_spare: Some(u32::from(*log.get(3)?)),
+        percent_used: Some(u32::from(*log.get(5)?)),
+        bytes_read: data(32),
+        bytes_written: data(48),
+        power_cycles: count(112),
+        power_on_hours: count(128),
+        unsafe_shutdowns: count(144),
+        media_errors: Some(count(160)?),
+        critical_warning: Some(log[0]),
+    })
+}
+
+/// Decodes the pages of an ATA drive's device statistics log that it handed out. A page
+/// counts only under its own number, and a statistic only when its flags say it is
+/// supported and valid. `None` when no page says anything.
+fn parse_ata_statistics(pages: &[Vec<u8>], sector_bytes: u64) -> Option<DriveHealth> {
+    let page = |number: u8| {
+        pages.iter().find(|page| page.len() >= ATA_LOG_PAGE_LEN && page[2] == number).map(Vec::as_slice)
+    };
+    let statistic = |number: u8, offset: usize| -> Option<u64> {
+        let bytes: [u8; 8] = page(number)?.get(offset..offset + 8)?.try_into().ok()?;
+        let quad = u64::from_le_bytes(bytes);
+        // Bit 63: the statistic is supported; bit 62: its value is valid.
+        (quad >> 62 == 0b11).then_some(quad & 0x0000_FFFF_FFFF_FFFF)
+    };
+    let sectors = |offset| statistic(1, offset).map(|count| u128::from(count) * u128::from(sector_bytes));
+    let health = DriveHealth {
+        power_cycles: statistic(1, 0x08),
+        power_on_hours: statistic(1, 0x10),
+        bytes_written: sectors(0x18),
+        bytes_read: sectors(0x28),
+        media_errors: statistic(4, 0x08),
+        // The current temperature is a signed byte.
+        temperature_c: statistic(5, 0x08).map(|value| f32::from(value as u8 as i8)),
+        percent_used: statistic(7, 0x08).map(|value| (value & 0xFF) as u32),
+        ..DriveHealth::default()
+    };
+    (health != DriveHealth::default()).then_some(health)
+}
+
+/// The size of a logical sector in bytes, from an ATA drive's identification: 512 unless
+/// word 106 is valid and says the size is given in words 117-118.
+fn logical_sector_bytes(identify: &[u8]) -> u64 {
+    let word = |index: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(identify.get(index * 2..index * 2 + 2)?.try_into().ok()?))
+    };
+    let long_sectors = word(ATA_SECTOR_SIZE).is_some_and(|w| w & 0xC000 == 0x4000 && w & 0x1000 != 0);
+    let words = || -> Option<u32> {
+        let at = ATA_LOGICAL_SECTOR_WORDS * 2;
+        Some(u32::from_le_bytes(identify.get(at..at + 4)?.try_into().ok()?))
+    };
+    long_sectors
+        .then(words)
+        .flatten()
+        .map(|words| u64::from(words) * 2)
+        .filter(|&bytes| bytes >= 512)
+        .unwrap_or(512)
+}
+
+/// The temperature of the first sensor in a `STORAGE_TEMPERATURE_DATA_DESCRIPTOR`: the
+/// drive's own, in whole degrees Celsius.
+fn parse_temperature(bytes: &[u8]) -> Option<f32> {
+    let sensors = u16::from_le_bytes(bytes.get(12..14)?.try_into().ok()?);
+    let first = bytes.get(TEMPERATURE_HEADER_LEN + 2..TEMPERATURE_HEADER_LEN + 4)?;
+    let celsius = f32::from(i16::from_le_bytes(first.try_into().ok()?));
+    (sensors > 0 && PLAUSIBLE_CELSIUS.contains(&celsius)).then_some(celsius)
 }
 
 /// The request for one standard property: a `STORAGE_PROPERTY_QUERY` without parameters.
@@ -228,6 +394,8 @@ struct ProtocolQuery {
     data_type: u32,
     /// Which one of them, e.g. the number of a log page.
     request: u32,
+    /// Which part of it, e.g. the page of an ATA log.
+    sub_request: u32,
     /// Size of the data in bytes.
     length: usize,
 }
@@ -244,8 +412,7 @@ impl ProtocolQuery {
             self.protocol,
             self.data_type,
             self.request,
-            // The request sub-value, unused by the requests made here.
-            0,
+            self.sub_request,
             // Where the data starts, counted from the protocol-specific part.
             PROTOCOL_DATA_LEN as u32,
             self.length as u32,
@@ -504,6 +671,66 @@ mod tests {
         answer
     }
 
+    /// An NVMe SMART / health information log page with the given counters.
+    fn health_log(kelvin: u16, spare: u8, used: u8, counters: [(usize, u64); 6]) -> Vec<u8> {
+        let mut log = vec![0u8; NVME_HEALTH_LEN];
+        log[1..3].copy_from_slice(&kelvin.to_le_bytes());
+        log[3] = spare;
+        log[5] = used;
+        for (offset, value) in counters {
+            log[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        log
+    }
+
+    /// A `STORAGE_TEMPERATURE_DATA_DESCRIPTOR` with one sensor per entry of `celsius`.
+    fn temperature_descriptor(celsius: &[i16]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 24];
+        bytes[12..14].copy_from_slice(&(celsius.len() as u16).to_le_bytes());
+        for (index, value) in celsius.iter().enumerate() {
+            let mut info = [0u8; 16];
+            info[0..2].copy_from_slice(&(index as u16).to_le_bytes());
+            info[2..4].copy_from_slice(&value.to_le_bytes());
+            bytes.extend(info);
+        }
+        bytes
+    }
+
+    #[test]
+    fn decodes_the_nvme_health_log() {
+        let log = health_log(
+            311,
+            100,
+            3,
+            [(32, 61_440), (48, 47_104), (112, 1_187), (128, 4_312), (144, 41), (160, 2)],
+        );
+        let health = parse_nvme_health(&log).unwrap();
+        assert_eq!(health.temperature_c, Some(38.0));
+        assert_eq!((health.available_spare, health.percent_used), (Some(100), Some(3)));
+        // Data units are thousands of 512-byte sectors.
+        assert_eq!(health.bytes_read, Some(61_440 * 512_000));
+        assert_eq!(health.bytes_written, Some(47_104 * 512_000));
+        assert_eq!((health.power_cycles, health.power_on_hours), (Some(1_187), Some(4_312)));
+        assert_eq!((health.unsafe_shutdowns, health.media_errors), (Some(41), Some(2)));
+        assert_eq!(health.critical_warning, Some(0));
+    }
+
+    #[test]
+    fn a_health_log_without_a_temperature_leaves_it_out() {
+        let log = health_log(0, 100, 0, [(32, 0), (48, 0), (112, 1), (128, 2), (144, 0), (160, 0)]);
+        assert_eq!(parse_nvme_health(&log).unwrap().temperature_c, None);
+        assert_eq!(parse_nvme_health(&log[..100]), None);
+    }
+
+    #[test]
+    fn decodes_the_temperature_property() {
+        assert_eq!(parse_temperature(&temperature_descriptor(&[41, 55])), Some(41.0));
+        assert_eq!(parse_temperature(&temperature_descriptor(&[])), None);
+        // A sensor that reads nothing sensible is no reading.
+        assert_eq!(parse_temperature(&temperature_descriptor(&[-273])), None);
+        assert_eq!(parse_temperature(&[0u8; 10]), None);
+    }
+
     /// ATA identification data with the two command set words set.
     fn ata_identify(command_sets_1: u16, command_sets_2: u16) -> Vec<u8> {
         let mut identify = vec![0u8; ATA_IDENTIFY_LEN];
@@ -660,6 +887,7 @@ mod tests {
             protocol: ProtocolTypeNvme.0 as u32,
             data_type: NVMeDataTypeIdentify.0 as u32,
             request: NVME_IDENTIFY_CONTROLLER,
+            sub_request: 0,
             length: NVME_IDENTIFY_LEN,
         };
         let query = identify.encode();
@@ -667,6 +895,95 @@ mod tests {
         let fields: Vec<u32> = (0..12).map(|field| u32_at(&query, field * 4).unwrap()).collect();
         assert_eq!(fields, [49, 0, 3, 1, 1, 0, 40, 4096, 0, 0, 0, 0]);
         assert!(query[48..].iter().all(|&byte| byte == 0));
+    }
+
+    /// A page of the ATA device statistics log: its header, then the given statistics,
+    /// each a quad word whose flags say it is supported and valid.
+    fn statistics_page(page: u8, statistics: &[(usize, u64)]) -> Vec<u8> {
+        let mut bytes = vec![0u8; ATA_LOG_PAGE_LEN];
+        bytes[0] = 1;
+        bytes[2] = page;
+        for &(offset, value) in statistics {
+            bytes[offset..offset + 8].copy_from_slice(&(value | 0xC000_0000_0000_0000).to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn the_drives_of_this_machine_tell_their_power_state() {
+        for drive in detect(&[]) {
+            let Some(disk) = DeviceHandle::open(&drive.device_path) else { continue };
+            let state = disk.is_awake();
+            // A fixed drive holding mounted volumes is in use, so it cannot be asleep.
+            if !drive.removable && !drive.volumes.is_empty() {
+                assert_ne!(state, Some(false), "{}", drive.name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_sleeping_disk_is_asked_only_what_windows_keeps() {
+        assert!(!asks_the_drive(Some(false)));
+        assert!(asks_the_drive(Some(true)));
+        // A disk that cannot tell its power state is taken to be awake.
+        assert!(asks_the_drive(None));
+    }
+
+    #[test]
+    fn asks_for_a_page_of_a_log() {
+        let request = ProtocolQuery {
+            property: StorageDeviceProtocolSpecificProperty,
+            protocol: ProtocolTypeAta.0 as u32,
+            data_type: AtaDataTypeLogPage.0 as u32,
+            request: ATA_LOG_DEVICE_STATISTICS,
+            sub_request: 5,
+            length: ATA_LOG_PAGE_LEN,
+        };
+        let fields: Vec<u32> = (0..8).map(|field| u32_at(&request.encode(), field * 4).unwrap()).collect();
+        assert_eq!(fields, [50, 0, 2, 2, 4, 5, 40, 512]);
+    }
+
+    #[test]
+    fn decodes_the_ata_device_statistics() {
+        let pages = [
+            statistics_page(1, &[(0x08, 2_046), (0x10, 21_904), (0x18, 1_000_000), (0x28, 3_000_000)]),
+            statistics_page(4, &[(0x08, 2)]),
+            // A temperature is a signed byte.
+            statistics_page(5, &[(0x08, 34)]),
+            statistics_page(7, &[(0x08, 6)]),
+        ];
+        let health = parse_ata_statistics(&pages, 4096).unwrap();
+        assert_eq!((health.power_cycles, health.power_on_hours), (Some(2_046), Some(21_904)));
+        assert_eq!((health.bytes_written, health.bytes_read), (Some(4_096_000_000), Some(12_288_000_000)));
+        assert_eq!(
+            (health.media_errors, health.temperature_c, health.percent_used),
+            (Some(2), Some(34.0), Some(6))
+        );
+        assert_eq!(health.critical_warning, None);
+    }
+
+    #[test]
+    fn ata_statistics_need_their_flags_and_page_numbers() {
+        // A statistic that is supported but not valid, and a sub-zero temperature.
+        let mut stale = statistics_page(1, &[]);
+        stale[0x10..0x18].copy_from_slice(&(0x8000_0000_0000_0000_u64 | 500).to_le_bytes());
+        let freezing = statistics_page(5, &[(0x08, 0xF6)]);
+        let health = parse_ata_statistics(&[stale, freezing], 512).unwrap();
+        assert_eq!(health.power_on_hours, None);
+        assert_eq!(health.temperature_c, Some(-10.0));
+        // No pages, or only a page cut short, tell nothing.
+        assert_eq!(parse_ata_statistics(&[], 512), None);
+        assert_eq!(parse_ata_statistics(&[statistics_page(4, &[(0x08, 99)])[..100].to_vec()], 512), None);
+    }
+
+    #[test]
+    fn reads_the_logical_sector_size() {
+        let mut identify = vec![0u8; ATA_IDENTIFY_LEN];
+        assert_eq!(logical_sector_bytes(&identify), 512);
+        // Word 106 valid with a long logical sector; words 117-118 give it in 16-bit words.
+        identify[212..214].copy_from_slice(&0x5000u16.to_le_bytes());
+        identify[234..238].copy_from_slice(&2048u32.to_le_bytes());
+        assert_eq!(logical_sector_bytes(&identify), 4096);
     }
 
     #[test]
@@ -685,6 +1002,7 @@ mod tests {
             protocol: 3,
             data_type: 2,
             request: NVME_LOG_HEALTH,
+            sub_request: 0,
             length: NVME_HEALTH_LEN,
         };
         assert_eq!(protocol_data(&request.encode()).map(<[u8]>::len), Some(NVME_HEALTH_LEN));

@@ -9,12 +9,15 @@ mod bench;
 mod brand;
 mod cli;
 mod config;
+mod crash;
 mod demo;
+mod elevation;
 mod hw;
 mod model;
 mod report;
 mod ui;
 
+use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::process::ExitCode;
@@ -23,13 +26,15 @@ use windows::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_UNKNOWN};
 use windows::Win32::System::Console::{
     AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
 };
+use windows::Win32::System::LibraryLoader::{SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};
 
 use cli::Command;
 use config::Config;
 use model::{ClockSnapshot, SystemInfo};
 
 fn main() -> ExitCode {
-    let args = match cli::parse(std::env::args().skip(1)) {
+    restrict_dll_search();
+    let args = match parse_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(message) => {
             attach_parent_console();
@@ -37,7 +42,18 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let window = args.command == Command::Gui;
+    if !window {
+        // A panic is told on the console, like every other message of these modes.
+        attach_parent_console();
+    }
+    crash::install(window);
     let cfg = Config::load();
+    // The driver serves elevated runs that the settings allow it for; the sample system
+    // reads nothing from the hardware.
+    if cfg.pawnio && !args.demo && elevation::current() == elevation::Elevation::Elevated {
+        hw::pawnio::enable();
+    }
     let base = config::exe_dir();
 
     let result = match &args.command {
@@ -47,6 +63,16 @@ fn main() -> ExitCode {
             Ok(())
         }
         Command::Gui => {
+            let request = elevation::Request {
+                window: true,
+                demo: args.demo,
+                no_admin: args.no_admin,
+                wanted: cfg.elevate,
+            };
+            // With the user's consent an elevated copy takes over; without it this one carries on.
+            if elevation::should_ask(elevation::current(), &request) && elevation::relaunch(None).is_ok() {
+                return ExitCode::SUCCESS;
+            }
             let code = ui::run(&cfg, &ui::Options { core: args.core, demo: args.demo });
             return ExitCode::from(u8::try_from(code).unwrap_or(1));
         }
@@ -74,7 +100,7 @@ fn main() -> ExitCode {
             println!("{sys:#?}\n{clocks:#?}");
             Ok(())
         }
-        Command::Bench => run_bench(&cfg, &base, args.demo),
+        Command::Bench => run_bench(&cfg, args.demo),
     };
 
     match result {
@@ -85,6 +111,25 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Makes Windows look for the DLLs this program loads later in the system directory only,
+/// never next to the executable or in the current directory. `false` when it refuses.
+fn restrict_dll_search() -> bool {
+    // SAFETY: takes no pointers; it only changes where this process's later loads search.
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32).is_ok() }
+}
+
+/// Parses the arguments after the program name. An argument that is not valid Unicode
+/// text is reported like any other bad option instead of ending the program.
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<cli::Args, String> {
+    let args = args
+        .into_iter()
+        .map(|arg| {
+            arg.into_string().map_err(|bad| format!("argument `{}` is not valid text", bad.to_string_lossy()))
+        })
+        .collect::<Result<Vec<String>, String>>()?;
+    cli::parse(args)
 }
 
 /// Connects standard output and standard error to the console the program was started from.
@@ -128,11 +173,12 @@ fn probe(cfg: &Config, demo: bool) -> (SystemInfo, ClockSnapshot) {
     (sys, clocks)
 }
 
-/// Runs the benchmark headless and writes the scores to `<computer name>.txt`.
+/// Runs the benchmark headless and writes the scores to `<computer name>.txt` in the data
+/// folder: next to the executable, or `%APPDATA%\rs-cpuz` when that folder is closed.
 ///
 /// With `demo` the file carries the names of the sample system; the scores are
 /// those of this machine all the same, measured on all of its logical processors.
-fn run_bench(cfg: &Config, base: &Path, demo: bool) -> Result<(), String> {
+fn run_bench(cfg: &Config, demo: bool) -> Result<(), String> {
     let (sys, _) = probe(cfg, demo);
     let threads = bench::thread_limit((!demo).then_some(&sys.cpu));
     let result = bench::run_blocking(threads).map_err(|error| error.to_string())?;
@@ -147,13 +193,30 @@ fn run_bench(cfg: &Config, base: &Path, demo: bool) -> Result<(), String> {
         result.threads,
         result.ratio(),
     );
-    let path = cli::output_path(base, name, &["txt"]);
-    std::fs::write(&path, text).map_err(|error| failure(&path, &error))
+    let path = cli::output_path(&config::data_dir(), name, &["txt"]);
+    std::fs::write(&path, text).map_err(|error| failure(&path, &error))?;
+    println!("Benchmark scores saved to {}", path.display());
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dll_search_is_restricted_to_the_system_directory() {
+        assert!(restrict_dll_search());
+    }
+
+    #[test]
+    fn arguments_that_are_not_unicode_are_rejected_not_fatal() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        // `-txt=` followed by an unpaired surrogate.
+        let broken = OsString::from_wide(&[0x2D, 0x74, 0x78, 0x74, 0x3D, 0xD800]);
+        assert!(parse_args([OsString::from("-dump"), broken]).is_err());
+        assert!(parse_args([OsString::from("-dump")]).is_ok());
+    }
 
     #[test]
     fn failure_names_the_path() {

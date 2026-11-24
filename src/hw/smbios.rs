@@ -23,6 +23,7 @@ pub mod kind {
     pub const OEM_STRINGS: u8 = 11;
     pub const MEMORY_ARRAY: u8 = 16;
     pub const MEMORY_DEVICE: u8 = 17;
+    pub const MEMORY_DEVICE_MAPPED_ADDRESS: u8 = 20;
     pub const ADDITIONAL_INFORMATION: u8 = 40;
     pub const END_OF_TABLE: u8 = 127;
 }
