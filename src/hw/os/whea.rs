@@ -17,6 +17,9 @@ const ERROR_EVENTS: PCWSTR =
 const BATCH: usize = 64;
 /// Milliseconds the event log service gets to hand over one batch.
 const TIMEOUT_MS: u32 = 2_000;
+/// Longest time the whole count may take; a log full of corrected errors can hold
+/// many thousands of events.
+const TOTAL_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What one fetch from an event query came back with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,13 +38,24 @@ pub fn error_count() -> Option<u32> {
             .map(|handle| Owned::new(handle))
     }
     .ok()?;
-    count(|| fetch(*query))
+    let started = std::time::Instant::now();
+    count_until(|| fetch(*query), || started.elapsed() > TOTAL_TIME)
 }
 
 /// Adds up the batches `next` returns until the query runs dry. `None` if a fetch fails.
-fn count(mut next: impl FnMut() -> Fetch) -> Option<u32> {
+#[cfg(test)]
+fn count(next: impl FnMut() -> Fetch) -> Option<u32> {
+    count_until(next, || false)
+}
+
+/// Adds up the batches `next` returns until the query runs dry. `None` if a fetch fails
+/// or `out_of_time` says so before the end: a partial count is not the count.
+fn count_until(mut next: impl FnMut() -> Fetch, mut out_of_time: impl FnMut() -> bool) -> Option<u32> {
     let mut total = 0u32;
     loop {
+        if out_of_time() {
+            return None;
+        }
         match next() {
             // A batch without events would never end the loop on its own.
             Fetch::End | Fetch::Events(0) => return Some(total),
@@ -91,6 +105,18 @@ mod tests {
     #[test]
     fn an_empty_batch_ends_the_count() {
         assert_eq!(count(replay(&[Fetch::Events(5), Fetch::Events(0), Fetch::Events(5)])), Some(5));
+    }
+
+    #[test]
+    fn a_log_that_takes_too_long_leaves_the_count_unknown() {
+        // An endless stream of full batches, read until the time is up.
+        let mut checks = 0;
+        let out_of_time = || {
+            checks += 1;
+            checks > 100
+        };
+        assert_eq!(count_until(|| Fetch::Events(64), out_of_time), None);
+        assert_eq!(count_until(replay(&[Fetch::Events(3)]), || false), Some(3));
     }
 
     #[test]

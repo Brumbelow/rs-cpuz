@@ -17,11 +17,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyIcon, DispatchMessageW, GetClientRect, GetMessageW, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW, RegisterClassExW, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, GWLP_USERDATA, HICON, HMENU, HTCAPTION, HTCLIENT, IDC_ARROW,
-    MSG, SM_CXICON, SM_CXSMICON, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WHEEL_DELTA, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CLOSE, WNDCLASSEXW, WNDCLASS_STYLES, WNDPROC,
+    CreateWindowExW, DestroyIcon, DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW, RegisterClassExW,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, GWLP_USERDATA, HICON, HMENU, HTCAPTION,
+    HTCLIENT, IDC_ARROW, MSG, SM_CXICON, SM_CXSMICON, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WHEEL_DELTA,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WNDCLASSEXW, WNDCLASS_STYLES, WNDPROC,
 };
 
 use crate::brand;
@@ -252,6 +252,40 @@ pub fn work_area_near(rect: RECT) -> Option<RECT> {
 /// Top-left corner that centres a `width` x `height` window in `area`.
 pub fn centred_in(area: RECT, width: i32, height: i32) -> (i32, i32) {
     (area.left + (area.right - area.left - width) / 2, area.top + (area.bottom - area.top - height) / 2)
+}
+
+/// Moves the top-left corner `(x, y)` of a `width` x `height` window as little as needed
+/// to keep the window inside `area`. A window larger than the area keeps its top-left
+/// corner, and with it the title strip, inside.
+pub fn kept_in(area: RECT, (x, y): (i32, i32), width: i32, height: i32) -> (i32, i32) {
+    let x = x.min(area.right - width).max(area.left);
+    let y = y.min(area.bottom - height).max(area.top);
+    (x, y)
+}
+
+/// Work area of the monitor the mouse pointer is on, where a window the user just asked
+/// for is expected; the primary monitor's when the pointer cannot be found.
+pub fn pointer_work_area() -> Option<RECT> {
+    let mut pointer = POINT::default();
+    // SAFETY: `pointer` is a valid POINT to write to; MonitorFromPoint has no preconditions.
+    match unsafe { GetCursorPos(&mut pointer) } {
+        Ok(()) => work_area(unsafe { MonitorFromPoint(pointer, MONITOR_DEFAULTTONEAREST) }),
+        Err(_) => primary_work_area(),
+    }
+}
+
+/// Opens `hwnd` in the middle of the monitor the pointer is on, sized by `size` for that
+/// monitor's DPI, and returns the DPI. The window is moved onto the monitor first, so that
+/// its DPI is that monitor's when it is measured.
+pub fn place_on_pointer_monitor(hwnd: HWND, size: impl Fn(u32) -> (i32, i32)) -> u32 {
+    let area = pointer_work_area().unwrap_or(RECT { left: 0, top: 0, right: 800, bottom: 600 });
+    let (width, height) = size(dpi_of(hwnd));
+    place(hwnd, area.left, area.top, width.max(1), height.max(1));
+    let dpi = dpi_of(hwnd);
+    let (width, height) = size(dpi);
+    let (x, y) = kept_in(area, centred_in(area, width, height), width, height);
+    place(hwnd, x, y, width, height);
+    dpi
 }
 
 /// Client rectangle of a window; empty when the window is gone.
@@ -533,5 +567,17 @@ mod tests {
         assert_eq!(centred_in(area, 417, 419), (751, 310));
         let second = RECT { left: -1280, top: 100, right: 0, bottom: 1124 };
         assert_eq!(centred_in(second, 400, 400), (-840, 412));
+    }
+
+    #[test]
+    fn windows_are_kept_inside_the_work_area() {
+        let area = RECT { left: -1920, top: 0, right: 0, bottom: 1040 };
+        // A window that fits stays where it was asked to be.
+        assert_eq!(kept_in(area, (-1500, 100), 400, 400), (-1500, 100));
+        // One hanging off an edge is pulled back in, title strip first.
+        assert_eq!(kept_in(area, (-200, -50), 400, 400), (-400, 0));
+        assert_eq!(kept_in(area, (-2100, 900), 400, 400), (-1920, 640));
+        // One larger than the area keeps its top-left corner, and so its title strip, inside.
+        assert_eq!(kept_in(area, (-2500, -300), 2500, 1200), (-1920, 0));
     }
 }

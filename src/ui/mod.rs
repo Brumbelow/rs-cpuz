@@ -35,9 +35,9 @@ use geom::{Scale, BASE_DPI};
 use layout::Tab;
 use state::{UiState, View};
 use theme::Theme;
-use tools::{ClocksTool, TimersTool};
+use tools::{ClocksTool, SensorsTool, TimersTool};
 
-/// File next to the executable that holds the saved benchmark references.
+/// File that holds the saved benchmark references, in the data folder (see [`config::data_dir`]).
 const REFERENCE_FILE: &str = "rs-cpuz-bench.txt";
 
 #[derive(Debug, Clone, Default)]
@@ -55,7 +55,8 @@ pub fn run(cfg: &Config, opts: &Options) -> i32 {
         && window::register(&icons)
         && popup::register()
         && tools::register::<ClocksTool>()
-        && tools::register::<TimersTool>();
+        && tools::register::<TimersTool>()
+        && tools::register::<SensorsTool>();
     if !registered {
         dialogs::error(None, "The application windows could not be set up.");
         return 1;
@@ -76,14 +77,36 @@ pub fn run(cfg: &Config, opts: &Options) -> i32 {
     code
 }
 
-/// Path of the benchmark reference file.
+/// Path of the benchmark reference file the next save goes to.
 fn reference_path() -> PathBuf {
-    config::exe_dir().join(REFERENCE_FILE)
+    config::data_dir().join(REFERENCE_FILE)
+}
+
+/// The saved benchmark references, from the executable's folder and from
+/// `%APPDATA%\rs-cpuz` alike.
+fn saved_references() -> Vec<bench::Reference> {
+    merge_references(&config::search_dirs(), &config::data_dir())
+}
+
+/// The references in the reference files of `dirs`, in order; for a name saved in more
+/// than one, the copy in `preferred` (the folder saves go to) wins.
+fn merge_references(dirs: &[PathBuf], preferred: &Path) -> Vec<bench::Reference> {
+    let mut merged: Vec<bench::Reference> = Vec::new();
+    for dir in dirs {
+        for reference in bench::load_references(&dir.join(REFERENCE_FILE)) {
+            match merged.iter_mut().find(|known| known.name == reference.name) {
+                Some(known) if dir == preferred => *known = reference,
+                Some(_) => {}
+                None => merged.push(reference),
+            }
+        }
+    }
+    merged
 }
 
 /// The initial window state for a detected system, its benchmark limited to `threads` threads.
 fn initial_state(sys: &SystemInfo, core: Option<u32>, threads: u32) -> UiState {
-    UiState::new(sys, core, threads, bench::load_references(&reference_path()))
+    UiState::new(sys, core, threads, saved_references())
 }
 
 /// Draws images off screen at 96 DPI and saves them as `.bmp` files in one directory.
@@ -115,7 +138,7 @@ impl Camera<'_> {
 /// Renders every tab to a `.bmp` file in `dir` without showing a window. Returns the files written.
 ///
 /// The images are drawn at 96 DPI: one per tab, named after it, plus
-/// `clocks.bmp` and `timers.bmp` for the two tool windows. The CPU tab shows
+/// `clocks.bmp`, `timers.bmp` and `sensors.bmp` for the tool windows. The CPU tab shows
 /// the clocks of `core`, as the window does when it is started with that core.
 pub fn snapshot(
     sys: &SystemInfo,
@@ -143,6 +166,10 @@ pub fn snapshot(
     camera.shoot("timers.bmp", tools::window_size::<TimersTool>(scale), |p| {
         tools::draw(p, &timers_tool, None, None);
     })?;
+    let sensors_tool = SensorsTool::new(&sys.sensors);
+    camera.shoot("sensors.bmp", tools::window_size::<SensorsTool>(scale), |p| {
+        tools::draw(p, &sensors_tool, None, None);
+    })?;
     Ok(camera.written)
 }
 
@@ -150,6 +177,24 @@ pub fn snapshot(
 mod tests {
     use super::*;
     use crate::demo;
+
+    #[test]
+    fn references_are_read_from_both_folders() {
+        let root = std::env::temp_dir().join(format!("rs-cpuz-test-{}-references", std::process::id()));
+        let (exe, app_data) = (root.join("exe"), root.join("appdata"));
+        let save = |dir: &Path, name: &str, single: f64| {
+            std::fs::create_dir_all(dir).unwrap();
+            let reference = bench::Reference { name: name.into(), single, multi: single * 10.0 };
+            bench::save_reference(&dir.join(REFERENCE_FILE), &reference).unwrap();
+        };
+        save(&exe, "Old PC", 300.0);
+        save(&exe, "This PC", 400.0);
+        save(&app_data, "This PC", 480.0);
+        let merged = merge_references(&[exe.clone(), app_data.clone()], &app_data);
+        let _ = std::fs::remove_dir_all(&root);
+        let scores: Vec<(&str, f64)> = merged.iter().map(|r| (r.name.as_str(), r.single)).collect();
+        assert_eq!(scores, [("Old PC", 300.0), ("This PC", 480.0)]);
+    }
 
     #[test]
     fn snapshot_shows_the_requested_core() {
@@ -167,7 +212,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let (Some(default), Some(core3)) = shots else { return };
 
-        assert_eq!(default.len(), Tab::ALL.len() + 2);
+        assert_eq!(default.len(), Tab::ALL.len() + 3);
         assert_eq!(Tab::ALL[0], Tab::Cpu);
         // Only the CPU tab follows the core; the Clocks tool lists every core anyway.
         assert!(default[0] != core3[0], "the CPU tab ignores the core");

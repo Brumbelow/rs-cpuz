@@ -79,6 +79,7 @@ fn interpret(sample: Sample) -> CpuInfo {
     let logical = topology::logical_processors(&topology, &facts);
     let core_sets = topology::core_sets(&logical, 0);
     let displayed = core_sets.first().map_or(CoreKind::Uniform, |set| set.kind);
+    let core_kinds: Vec<CoreKind> = core_sets.iter().map(|set| set.kind).collect();
     let cores: u32 = core_sets.iter().map(|set| set.cores).sum();
     let threads: u32 = core_sets.iter().map(|set| set.threads).sum();
     // A capacity below what the package holds is not one: the count behind it saturated or is not kept up.
@@ -91,6 +92,7 @@ fn interpret(sample: Sample) -> CpuInfo {
         technology_nm: known.and_then(|k| k.technology_nm),
         max_tdp_w: db::max_tdp(&name),
         core_voltage: None,
+        ratio_range: None,
         family: signature.family,
         model: signature.model,
         stepping: signature.stepping,
@@ -99,7 +101,7 @@ fn interpret(sample: Sample) -> CpuInfo {
         revision: db::revision(vendor, signature.ext_family, signature.ext_model, signature.stepping)
             .map(str::to_string),
         instructions: features::instructions(vendor, leaves, xcr0),
-        caches: package_caches(&topology, &logical, &thread_dumps, displayed),
+        caches: package_caches(&topology, &logical, &thread_dumps, &core_kinds),
         cores,
         threads,
         max_cores: capacity.map(|capacity| capacity.cores).filter(|&max| max >= cores),
@@ -119,40 +121,69 @@ fn interpret(sample: Sample) -> CpuInfo {
     }
 }
 
-/// The caches of the first package, as seen by its cores of the `displayed` kind.
+/// The caches of the first package: those of each core type, in the order of `kinds`
+/// (the performance cores of a hybrid part first).
 fn package_caches(
     topology: &OsTopology,
     logical: &[LogicalProcessor],
     thread_dumps: &[ThreadDump],
-    displayed: CoreKind,
+    kinds: &[CoreKind],
 ) -> Vec<CacheInfo> {
     let described: BTreeMap<u32, Vec<CacheDesc>> =
         thread_dumps.iter().map(|dump| (dump.processor, cache::describe(Leaves(&dump.leaves)))).collect();
     let members = || logical.iter().filter(|lp| lp.package == 0);
+    let core_set = |kind: CoreKind| kinds.iter().position(|&listed| listed == kind).unwrap_or(kinds.len());
 
     // The exact picture needs CPUID from every thread of the package.
     let threads: Option<Vec<ThreadCaches>> = members()
         .map(|lp| {
             let caches = described.get(&lp.index)?.clone();
-            Some(ThreadCaches { apic_id: lp.apic_id, displayed: lp.kind == displayed, caches })
+            Some(ThreadCaches { apic_id: lp.apic_id, core_set: core_set(lp.kind), caches })
         })
         .collect();
     if let Some(list) = threads.filter(|t| !t.is_empty()).and_then(|t| cache::summarize(&t)) {
         return list;
     }
 
-    // Otherwise describe the caches from one thread and let Windows count the instances
-    // among the processors of that thread's core type: the displayed type when one of
-    // its threads was sampled, else whichever type the first sampled thread belongs to.
+    // Otherwise each core type describes its caches from one of its sampled threads and
+    // Windows counts the instances among the processors of that type. A type none of
+    // whose threads was sampled is left out. A cache another type already listed, with
+    // the same geometry on the same instances, is the one they share (the L3 of a hybrid
+    // part) and is listed once; on instances of its own it is this type's, as in
+    // `cache::summarize`. Without any sampled thread of a listed type, the first sampled
+    // thread describes the caches.
     let of_kind = |kind: CoreKind| members().filter(move |lp| lp.kind == kind).map(|lp| lp.index);
-    let reference = of_kind(displayed)
-        .find(|index| described.contains_key(index))
-        .or_else(|| described.keys().next().copied());
-    let Some(caches) = reference.and_then(|index| described.get(&index)) else { return Vec::new() };
-    // A thread Windows does not list has no peers to count; its caches then count once each.
-    let kind = logical.iter().find(|lp| Some(lp.index) == reference).map(|lp| lp.kind);
-    let counted: Vec<u32> = kind.map(|kind| of_kind(kind).collect()).unwrap_or_default();
-    cache::with_counts(caches, |cache| topology.cache_count(cache.level, cache.kind, cache.size_kb, &counted))
+    let counted_caches = |caches: &[CacheDesc], counted: &[u32]| {
+        cache::with_counts(caches, |cache| {
+            topology.cache_count(cache.level, cache.kind, cache.size_kb, counted)
+        })
+    };
+    let mut listed: Vec<(CacheInfo, Vec<usize>)> = Vec::new();
+    for &kind in kinds {
+        let Some(caches) = of_kind(kind).find_map(|index| described.get(&index)) else { continue };
+        let counted: Vec<u32> = of_kind(kind).collect();
+        for cache in counted_caches(caches, &counted) {
+            let instances = topology.cache_instances(cache.level, cache.kind, cache.size_kb, &counted);
+            if !listed.iter().any(|(other, seen)| same_geometry(other, &cache) && *seen == instances) {
+                listed.push((cache, instances));
+            }
+        }
+    }
+    let mut list: Vec<CacheInfo> = listed.into_iter().map(|(cache, _)| cache).collect();
+    if list.is_empty() {
+        let Some((&index, caches)) = described.iter().next() else { return Vec::new() };
+        // A thread Windows does not list has no peers to count; its caches then count once each.
+        let kind = logical.iter().find(|lp| lp.index == index).map(|lp| lp.kind);
+        let counted: Vec<u32> = kind.map(|kind| of_kind(kind).collect()).unwrap_or_default();
+        list = counted_caches(caches, &counted);
+    }
+    cache::sort(&mut list);
+    list
+}
+
+/// Whether two caches are built alike: same level, kind, size, associativity and line.
+fn same_geometry(a: &CacheInfo, b: &CacheInfo) -> bool {
+    (a.level, a.kind, a.size_kb, a.ways, a.line_size) == (b.level, b.kind, b.size_kb, b.ways, b.line_size)
 }
 
 /// The advertised base frequency: CPUID leaf 16h, else the brand string, else the firmware value.
@@ -334,11 +365,16 @@ mod tests {
             (cpu.logical[16].apic_id, cpu.logical[16].core, cpu.logical[16].kind),
             (64, 8, CoreKind::Efficient)
         );
-        // The cache list is that of the P-cores; the L3 they share with the E-cores counts all 32 threads.
-        assert_eq!(cache_line(&cpu, 1, CacheKind::Data), ("8 x 48 KBytes".into(), "12-way".into(), 2));
-        assert_eq!(cache_line(&cpu, 2, CacheKind::Unified), ("8 x 2 MBytes".into(), "16-way".into(), 2));
+        // Each core type lists its own caches, P-cores first; the L3 both types share is listed
+        // once and counts all 32 threads.
+        let sizes =
+            |level, kind| cpu.caches_of(level, kind).iter().map(|c| c.size_text()).collect::<Vec<_>>();
+        assert_eq!(sizes(1, CacheKind::Data), ["8 x 48 KBytes", "16 x 32 KBytes"]);
+        assert_eq!(sizes(1, CacheKind::Instruction), ["8 x 32 KBytes", "16 x 64 KBytes"]);
+        assert_eq!(sizes(2, CacheKind::Unified), ["8 x 2 MBytes", "4 x 4 MBytes"]);
         assert_eq!(cache_line(&cpu, 3, CacheKind::Unified), ("36 MBytes".into(), "12-way".into(), 32));
-        assert_eq!(cpu.caches.len(), 4);
+        let sharing: Vec<u32> = cpu.caches.iter().map(|c| c.threads_sharing).collect();
+        assert_eq!(sharing, [2, 1, 2, 1, 2, 4, 32]);
         assert_eq!(cpu.microcode, Some(0x12B));
         // Leaf 16h wins over the measured value.
         assert_eq!(cpu.nominal_mhz, Some(3000.0));
@@ -432,6 +468,51 @@ mod tests {
         assert_eq!(cache_line(&cpu, 1, CacheKind::Instruction), ("8 x 32 KBytes".into(), "8-way".into(), 2));
         assert_eq!(cache_line(&cpu, 2, CacheKind::Unified), ("8 x 2 MBytes".into(), "16-way".into(), 2));
         assert_eq!(cache_line(&cpu, 3, CacheKind::Unified), ("36 MBytes".into(), "12-way".into(), 32));
+    }
+
+    #[test]
+    fn partial_sampling_lists_each_sampled_core_type() {
+        // One thread of each kind could not be pinned: each type still lists its own caches,
+        // counted by Windows among the processors of that type, and the shared L3 once.
+        let mut sample = hybrid_sample();
+        sample.thread_dumps.retain(|dump| dump.processor != 3 && dump.processor != 20);
+        let cpu = interpret(sample);
+        let sizes =
+            |level, kind| cpu.caches_of(level, kind).iter().map(|c| c.size_text()).collect::<Vec<_>>();
+        assert_eq!(sizes(1, CacheKind::Data), ["8 x 48 KBytes", "16 x 32 KBytes"]);
+        assert_eq!(sizes(1, CacheKind::Instruction), ["8 x 32 KBytes", "16 x 64 KBytes"]);
+        assert_eq!(sizes(2, CacheKind::Unified), ["8 x 2 MBytes", "4 x 4 MBytes"]);
+        assert_eq!(sizes(3, CacheKind::Unified), ["36 MBytes"]);
+    }
+
+    #[test]
+    fn lists_alike_caches_of_each_core_type() {
+        // E-core clusters with an L2 built like a P-core's, 2 MB 16-way, as on Meteor Lake.
+        let alike = || {
+            let mut sample = hybrid_sample();
+            for dump in &mut sample.thread_dumps[16..] {
+                for leaf in dump.leaves.iter_mut().filter(|leaf| (leaf.leaf, leaf.subleaf) == (4, 2)) {
+                    leaf.ecx = 0x7FF;
+                }
+            }
+            for cache in sample.topology.caches.iter_mut().filter(|cache| cache.size_kb == 4096) {
+                cache.size_kb = 2048;
+            }
+            sample
+        };
+        let mut partial = alike();
+        partial.thread_dumps.retain(|dump| dump.processor != 3 && dump.processor != 20);
+        // From every thread's CPUID or from Windows' counts, each type keeps its own L2,
+        // and the L3 the two share is listed once.
+        for cpu in [interpret(alike()), interpret(partial)] {
+            let level2: Vec<(String, u32)> = cpu
+                .caches_of(2, CacheKind::Unified)
+                .iter()
+                .map(|cache| (cache.size_text(), cache.threads_sharing))
+                .collect();
+            assert_eq!(level2, [("8 x 2 MBytes".to_string(), 2), ("4 x 2 MBytes".to_string(), 4)]);
+            assert_eq!(cpu.caches_of(3, CacheKind::Unified).len(), 1);
+        }
     }
 
     #[test]

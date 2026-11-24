@@ -61,7 +61,6 @@ impl OsTopology {
 
     /// How many instances of a cache of this size the given logical processors
     /// see, and the largest number of logical processors sharing one of them.
-    /// Instances of another size are a different cache, even at the same level.
     pub fn cache_count(
         &self,
         level: u8,
@@ -69,12 +68,20 @@ impl OsTopology {
         size_kb: u32,
         members: &[u32],
     ) -> Option<(u32, u32)> {
-        let seen = |c: &&OsCache| {
+        let instances = self.cache_instances(level, kind, size_kb, members);
+        let sharing = instances.iter().map(|&index| self.caches[index].processors.len()).max()?;
+        Some((instances.len() as u32, sharing as u32))
+    }
+
+    /// The instances of a cache of this size the given logical processors see, as
+    /// positions in `caches`. Instances of another size are a different cache, even at
+    /// the same level.
+    pub fn cache_instances(&self, level: u8, kind: CacheKind, size_kb: u32, members: &[u32]) -> Vec<usize> {
+        let seen = |c: &OsCache| {
             (c.level, c.kind, c.size_kb) == (level, kind, size_kb)
                 && c.processors.iter().any(|p| members.contains(p))
         };
-        let sharing = self.caches.iter().filter(seen).map(|c| c.processors.len()).max()?;
-        Some((self.caches.iter().filter(seen).count() as u32, sharing as u32))
+        self.caches.iter().enumerate().filter(|(_, c)| seen(c)).map(|(index, _)| index).collect()
     }
 }
 

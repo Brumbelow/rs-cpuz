@@ -16,6 +16,12 @@ mod array_field {
     pub const ERROR_CORRECTION: usize = 0x06;
 }
 
+/// Offsets inside a memory device mapped address structure (type 20).
+mod mapped_field {
+    pub const DEVICE_HANDLE: usize = 0x0C;
+    pub const INTERLEAVE_POSITION: usize = 0x11;
+}
+
 /// Memory array use: main system memory (as opposed to video, flash, cache ...).
 const USE_SYSTEM_MEMORY: u8 = 0x03;
 
@@ -220,18 +226,36 @@ pub struct Slot {
     pub kind: Option<MemoryType>,
     /// Speed the installed module is rated for, in MT/s (MHz on pre-DDR parts).
     pub rated_speed: Option<u32>,
+    /// Position of the module in its interleave set (1 for the first), as the firmware's
+    /// mapped-address records state it. `None` when they do not say or disagree.
+    pub interleave: Option<u8>,
 }
 
 /// Decodes every memory device that is a system-memory slot, in firmware order.
 pub fn slots(smbios: &Smbios) -> Vec<Slot> {
     let mut slots: Vec<Slot> = smbios
         .of_kind(kind::MEMORY_DEVICE)
-        .filter_map(|device| decode(device, owning_array(smbios, device)))
+        .filter_map(|device| {
+            let slot = decode(device, owning_array(smbios, device))?;
+            Some(Slot { interleave: interleave_position(smbios, device), ..slot })
+        })
         .collect();
     for (index, slot) in slots.iter_mut().enumerate() {
         slot.module.slot = format!("Slot #{}", index + 1);
     }
     slots
+}
+
+/// The interleave position the mapped-address records (type 20) of `device` give it:
+/// 1 for the first position of an interleave set. Position 0 (not interleaved), 0xFF
+/// (unknown) and records that disagree give `None`.
+fn interleave_position(smbios: &Smbios, device: &SmbiosStructure) -> Option<u8> {
+    let mut positions = smbios
+        .of_kind(kind::MEMORY_DEVICE_MAPPED_ADDRESS)
+        .filter(|record| record.word(mapped_field::DEVICE_HANDLE) == Some(device.handle))
+        .map(|record| record.byte(mapped_field::INTERLEAVE_POSITION));
+    let first = positions.next()??;
+    positions.all(|position| position == Some(first)).then_some(first).filter(|&p| p != 0 && p != 0xFF)
 }
 
 /// The physical memory array a device belongs to.
@@ -258,6 +282,7 @@ fn decode(device: &SmbiosStructure, array: Option<&SmbiosStructure>) -> Option<S
         bank_locator: label(field::BANK_LOCATOR),
         kind,
         rated_speed: size.and_then(|_| memory_device::rated_speed(device)),
+        interleave: None,
     })
 }
 
@@ -407,6 +432,22 @@ pub(super) mod fixtures {
         body[4] = 0x03;
         body[5] = usage;
         body[6] = error_correction;
+        let mut table = Vec::new();
+        push_structure(&mut table, &body, &[]);
+        table
+    }
+
+    /// A memory device mapped address (type 20) of device `device`, with the given
+    /// interleave position and interleaved data depth.
+    pub fn mapped(device: u16, position: u8, depth: u8) -> Vec<u8> {
+        let mut body = vec![0u8; 0x13];
+        body[0] = 20;
+        body[1] = 0x13;
+        body[2..4].copy_from_slice(&(0x2000 + device).to_le_bytes());
+        body[0x0C..0x0E].copy_from_slice(&device.to_le_bytes());
+        body[0x10] = 0xFF;
+        body[0x11] = position;
+        body[0x12] = depth;
         let mut table = Vec::new();
         push_structure(&mut table, &body, &[]);
         table

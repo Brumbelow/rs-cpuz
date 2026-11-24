@@ -190,6 +190,18 @@ pub fn populated<'a>(labels: impl IntoIterator<Item = (&'a str, &'a str)>) -> Op
     per_socket(&channels)
 }
 
+/// Counts the populated channels from the interleave positions the firmware gives the
+/// installed modules. Only a set of distinct positions numbered 1 to N, one per module and
+/// at least two, says that the modules sit on N channels interleaved with each other; a
+/// missing, repeated or out-of-range position says nothing.
+pub fn interleaved(positions: impl IntoIterator<Item = Option<u8>>) -> Option<u32> {
+    let positions: Vec<u8> = positions.into_iter().collect::<Option<_>>()?;
+    let distinct: BTreeSet<u8> = positions.iter().copied().collect();
+    let count = positions.len();
+    let numbered = distinct.len() == count && distinct.iter().copied().eq(1..=u8::try_from(count).ok()?);
+    (count >= 2 && numbered).then(|| u32::try_from(count).ok()).flatten()
+}
+
 /// The "Channels #" text for `channels` populated channels. Controllers up to DDR4
 /// are described by a channel-count name; DDR5 lists its 32-bit sub-channels, two
 /// per channel. Counts without a name and LPDDR4/5 layouts are left unknown.

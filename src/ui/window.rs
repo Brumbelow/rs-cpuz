@@ -22,6 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::bench::{self, Phase, Reference};
 use crate::brand;
 use crate::config::Config;
+use crate::elevation::{self, Elevation};
 use crate::model::{ClockSnapshot, SystemInfo};
 use crate::report;
 
@@ -35,9 +36,9 @@ use super::geom::{height, width, Scale, BASE_DPI};
 use super::layout::{about, bench as bench_id, Kind, Tab, TOOLS_BUTTON};
 use super::popup;
 use super::render;
-use super::state::{BenchMode, ListId, Target, UiState, View};
+use super::state::{self, BenchMode, ListId, Target, ToolsEntry, UiState, View};
 use super::theme::Theme;
-use super::tools::{self, ClocksTool, TimersTool, Tool};
+use super::tools::{self, ClocksTool, SensorsTool, TimersTool, Tool};
 use super::win::{self, Canvas, Icons};
 use super::Options;
 
@@ -61,6 +62,8 @@ enum Command {
     CopyImage(Surface),
     OpenClocks,
     OpenTimers,
+    OpenSensors,
+    RestartAsAdmin,
     Error(String),
 }
 
@@ -89,6 +92,7 @@ struct App {
     tracking: bool,
     clocks_tool: Option<HWND>,
     timers_tool: Option<HWND>,
+    sensors_tool: Option<HWND>,
 }
 
 /// Registers the window class of the main window.
@@ -110,6 +114,8 @@ pub fn run(
     let threads = bench::thread_limit((!opts.demo).then_some(&sys.cpu));
     let mut ui = super::initial_state(&sys, opts.core, threads);
     ui.bench.sample = opts.demo;
+    // A copy that runs without full rights may restart with them; the sample system gains nothing.
+    ui.offer_admin = !opts.demo && elevation::current() != Elevation::Elevated;
     let app = App {
         cfg: cfg.clone(),
         theme: Theme::new(cfg),
@@ -124,18 +130,15 @@ pub fn run(
         tracking: false,
         clocks_tool: None,
         timers_tool: None,
+        sensors_tool: None,
     };
     let style = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX;
     let Some(hwnd) = win::create_window(CLASS, brand::APP_NAME, style, WS_EX_APPWINDOW, None, app) else {
         return 1;
     };
-    // The window was created on the primary monitor, so its DPI is the one to lay out for.
-    let dpi = win::dpi_of(hwnd);
+    // The window opens on the monitor the pointer is on, laid out for that monitor's DPI.
+    let dpi = win::place_on_pointer_monitor(hwnd, |dpi| render::frame_size(Scale::new(dpi)));
     with_app(hwnd, |app| app.canvas.set_dpi(&app.cfg, dpi));
-    let (window_width, window_height) = render::frame_size(Scale::new(dpi));
-    let fallback = RECT { left: 0, top: 0, right: window_width, bottom: window_height };
-    let (x, y) = win::centred_in(win::primary_work_area().unwrap_or(fallback), window_width, window_height);
-    win::place(hwnd, x, y, window_width, window_height);
     mailbox.listen(Some(hwnd));
     win::show(hwnd);
     // SAFETY: SetForegroundWindow validates the handle; failing to get the foreground is harmless.
@@ -213,15 +216,23 @@ fn control_action(tab: Tab, id: u16) -> Option<Action> {
     })
 }
 
-/// The command behind entry `index` of the "Tools" menu.
+/// The command behind entry `index` of the "Tools" menu as it is without the
+/// administrator entry.
+#[cfg(test)]
 fn tools_menu_command(index: usize) -> Option<Command> {
-    match index {
-        0 => Some(Command::SaveReport(ReportKind::Txt)),
-        1 => Some(Command::SaveReport(ReportKind::Html)),
-        2 => Some(Command::OpenClocks),
-        3 => Some(Command::OpenTimers),
-        _ => None,
-    }
+    menu_command(state::tools_menu(false), index)
+}
+
+/// The command behind entry `index` of the "Tools" menu `entries`.
+fn menu_command(entries: Vec<ToolsEntry>, index: usize) -> Option<Command> {
+    Some(match entries.get(index)? {
+        ToolsEntry::SaveTxt => Command::SaveReport(ReportKind::Txt),
+        ToolsEntry::SaveHtml => Command::SaveReport(ReportKind::Html),
+        ToolsEntry::Clocks => Command::OpenClocks,
+        ToolsEntry::Timers => Command::OpenTimers,
+        ToolsEntry::Sensors => Command::OpenSensors,
+        ToolsEntry::RestartAsAdmin => Command::RestartAsAdmin,
+    })
 }
 
 impl App {
@@ -402,7 +413,7 @@ impl App {
         if let Err(error) = bench::save_reference(&path, &reference) {
             return Reply::Run(Command::Error(save_failure(&path, &error)));
         }
-        self.ui.bench.references = bench::load_references(&path);
+        self.ui.bench.references = super::saved_references();
         self.ui.bench.reference = self.ui.bench.references.iter().position(|r| r.name == reference.name);
         Reply::Done(0)
     }
@@ -437,6 +448,11 @@ impl App {
                         tools::update_clocks(tool, &self.clocks);
                     }
                 }
+                Event::Sensors(sensors) => {
+                    if let Some(tool) = self.sensors_tool {
+                        tools::update_sensors(tool, &sensors);
+                    }
+                }
                 Event::Bench(run, event) if run == self.run => {
                     self.ui.bench.apply(event);
                     if self.ui.bench.mode == BenchMode::Idle {
@@ -453,7 +469,8 @@ impl App {
     fn choice(&mut self, hwnd: HWND, code: usize, index: usize) -> Reply {
         let Some(list) = ListId::from_code(code) else { return Reply::Done(0) };
         if list == ListId::ToolsMenu {
-            return tools_menu_command(index).map_or(Reply::Done(0), Reply::Run);
+            return menu_command(state::tools_menu(self.ui.offer_admin), index)
+                .map_or(Reply::Done(0), Reply::Run);
         }
         self.ui.choose(list, index, &self.sys, &self.clocks);
         win::invalidate(hwnd);
@@ -493,6 +510,10 @@ impl App {
             win::WM_TOOL_CLOSED => match wparam.0 {
                 ClocksTool::CODE => self.clocks_tool = None,
                 TimersTool::CODE => self.timers_tool = None,
+                SensorsTool::CODE => {
+                    self.sensors_tool = None;
+                    self.mailbox.want_sensors(false);
+                }
                 _ => {}
             },
             WM_DPICHANGED => {
@@ -532,15 +553,21 @@ fn save_report(hwnd: HWND, kind: ReportKind) {
     }
 }
 
-/// Opens a tool window, or brings the one that is already open to the front.
-fn open_tool<T: Tool>(hwnd: HWND, slot: fn(&mut App) -> &mut Option<HWND>, make: impl FnOnce(&App) -> T) {
+/// Opens a tool window, or brings the one that is already open to the front. `true` when
+/// a new window opened.
+fn open_tool<T: Tool>(
+    hwnd: HWND,
+    slot: fn(&mut App) -> &mut Option<HWND>,
+    make: impl FnOnce(&App) -> T,
+) -> bool {
     if let Some(Some(existing)) = with_app(hwnd, |app| *slot(app)) {
         tools::focus(existing);
-        return;
+        return false;
     }
-    let Some((cfg, tool)) = with_app(hwnd, |app| (app.cfg.clone(), make(app))) else { return };
+    let Some((cfg, tool)) = with_app(hwnd, |app| (app.cfg.clone(), make(app))) else { return false };
     let opened = tools::open(hwnd, &cfg, tool);
     with_app(hwnd, |app| *slot(app) = opened);
+    opened.is_some()
 }
 
 /// Carries out a command. The window state is not borrowed here, so the dialogs
@@ -579,9 +606,26 @@ fn execute(hwnd: HWND, command: Command) {
             }
         }
         Command::OpenClocks => {
-            open_tool(hwnd, |app| &mut app.clocks_tool, |app| ClocksTool::new(&app.clocks))
+            open_tool(hwnd, |app| &mut app.clocks_tool, |app| ClocksTool::new(&app.clocks));
         }
-        Command::OpenTimers => open_tool(hwnd, |app| &mut app.timers_tool, |_| TimersTool::default()),
+        Command::OpenTimers => {
+            open_tool(hwnd, |app| &mut app.timers_tool, |_| TimersTool::default());
+        }
+        Command::OpenSensors => {
+            // The worker reads the sensors only while their window is open.
+            if open_tool(hwnd, |app| &mut app.sensors_tool, |app| SensorsTool::new(&app.sys.sensors)) {
+                with_app(hwnd, |app| app.mailbox.want_sensors(true));
+            }
+        }
+        Command::RestartAsAdmin => match elevation::relaunch(Some(hwnd)) {
+            // The elevated copy takes over.
+            Ok(()) => win::post_close(hwnd),
+            Err(elevation::Refused::Declined) => {}
+            Err(elevation::Refused::Failed(error)) => dialogs::error(
+                Some(hwnd),
+                &format!("The program could not be restarted as administrator: {error}"),
+            ),
+        },
         Command::Error(text) => dialogs::error(Some(hwnd), &text),
     }
 }
@@ -646,8 +690,9 @@ mod tests {
         assert!(matches!(tools_menu_command(1), Some(Command::SaveReport(ReportKind::Html))));
         assert!(matches!(tools_menu_command(2), Some(Command::OpenClocks)));
         assert!(matches!(tools_menu_command(3), Some(Command::OpenTimers)));
-        assert!(tools_menu_command(4).is_none());
-        assert_eq!(crate::ui::state::TOOLS_MENU.len(), 4);
+        assert!(matches!(tools_menu_command(4), Some(Command::OpenSensors)));
+        assert!(tools_menu_command(5).is_none());
+        assert!(matches!(menu_command(state::tools_menu(true), 5), Some(Command::RestartAsAdmin)));
     }
 
     #[test]

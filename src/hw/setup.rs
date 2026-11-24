@@ -194,10 +194,7 @@ impl Device<'_> {
                 buffer.truncate(required.min(buffer.len()));
                 return Some((REG_VALUE_TYPE(kind), buffer));
             }
-            if required <= buffer.len() {
-                return None;
-            }
-            buffer.resize(required, 0);
+            buffer.resize(grown_size(required, buffer.len())?, 0);
         }
         None
     }
@@ -325,6 +322,16 @@ pub fn wide_strings(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Largest device property read, in bytes; the longest real ones (hardware id lists)
+/// take a few hundred.
+const MAX_PROPERTY: usize = 64 * 1024;
+
+/// The size to grow a property buffer of `current` bytes to after SetupAPI asked for
+/// `required`: `None` when that would not grow it, or would exceed [`MAX_PROPERTY`].
+fn grown_size(required: usize, current: usize) -> Option<usize> {
+    (required > current && required <= MAX_PROPERTY).then_some(required)
+}
+
 #[cfg(test)]
 mod tests {
     use windows::Win32::Devices::DeviceAndDriverInstallation::{GUID_DEVCLASS_COMPUTER, SPDRP_CLASS};
@@ -371,5 +378,14 @@ mod tests {
         // A made-up interface class has no interfaces.
         let class = GUID::from_u128(0x7273_6370_757a_4000_8000_0000_0000_0001);
         assert_eq!(InterfaceSet::open(&class).map_or(0, |set| set.interfaces().count()), 0);
+    }
+
+    #[test]
+    fn property_buffers_grow_within_bounds() {
+        assert_eq!(grown_size(600, 256), Some(600));
+        // An answer that would not grow the buffer, or would grow it without limit, ends the reading.
+        assert_eq!(grown_size(200, 256), None);
+        assert_eq!(grown_size(MAX_PROPERTY + 1, 256), None);
+        assert_eq!(grown_size(usize::MAX, 256), None);
     }
 }

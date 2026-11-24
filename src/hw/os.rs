@@ -61,7 +61,9 @@ pub fn detect() -> OsInfo {
         name: string("ProductName")
             .map(|product| os_name(&product, build_number, native_arch()))
             .unwrap_or_default(),
-        build: build.map(|b| build_text(&b, dword("UBR"))).unwrap_or_default(),
+        build: build
+            .map(|b| build_text(&b, dword("UBR"), string("DisplayVersion").as_deref()))
+            .unwrap_or_default(),
         directx: system_directory().and_then(|dir| directx_version(|dll| dir.join(dll).exists())),
         computer_name: computer_name().unwrap_or_default(),
         install_date: first_install_time(dword(INSTALL_DATE))
@@ -87,10 +89,15 @@ fn os_name(product: &str, build: Option<u32>, arch: Option<&str>) -> String {
 }
 
 /// `Build 26100.2314` - the build number and, when known, the update revision.
-fn build_text(build: &str, revision: Option<u32>) -> String {
-    match revision {
+/// `Build 26100.2314 (24H2)`: build, update revision and the feature update it belongs to.
+fn build_text(build: &str, revision: Option<u32>, display_version: Option<&str>) -> String {
+    let numbered = match revision {
         Some(revision) => format!("Build {build}.{revision}"),
         None => format!("Build {build}"),
+    };
+    match display_version.map(str::trim).filter(|version| !version.is_empty()) {
+        Some(version) => format!("{numbered} ({version})"),
+        None => numbered,
     }
 }
 
@@ -321,8 +328,8 @@ mod tests {
 
     #[test]
     fn formats_build() {
-        assert_eq!(build_text("26100", Some(2314)), "Build 26100.2314");
-        assert_eq!(build_text("19045", None), "Build 19045");
+        assert_eq!(build_text("26100", Some(2314), None), "Build 26100.2314");
+        assert_eq!(build_text("19045", None, None), "Build 19045");
     }
 
     #[test]
@@ -398,6 +405,13 @@ mod tests {
         assert_eq!(software.string("rs-cpuz-test-missing"), None);
         assert_eq!(software.dword("rs-cpuz-test-missing"), None);
         assert!(software.subkey_names().iter().any(|name| name.eq_ignore_ascii_case("Microsoft")));
+    }
+
+    #[test]
+    fn the_build_names_the_feature_update() {
+        assert_eq!(build_text("26300", Some(9974), Some("26H2")), "Build 26300.9974 (26H2)");
+        assert_eq!(build_text("19045", Some(5247), None), "Build 19045.5247");
+        assert_eq!(build_text("22000", None, Some(" ")), "Build 22000");
     }
 
     #[test]

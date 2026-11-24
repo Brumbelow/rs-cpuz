@@ -1,7 +1,7 @@
 //! The storage section: drives, their controllers and the volumes on them.
 
 use crate::hw::storage::bus_name;
-use crate::model::{DriveController, DriveInfo, VolumeInfo};
+use crate::model::{DriveController, DriveHealth, DriveInfo, VolumeInfo};
 
 use super::doc::{Lines, Section};
 
@@ -22,6 +22,9 @@ pub(super) fn section(drives: &[DriveInfo]) -> Section {
         out.pair(1, "Type", kind(drive));
         out.opt(1, "Bus Type", drive.bus_type.map(bus_text));
         out.pair(1, "Features", drive.features.join(", "));
+        if let Some(health) = &drive.health {
+            health_lines(&mut out, health);
+        }
         if let Some(controller) = &drive.controller {
             out.pair(1, "Controller", controller_text(controller));
             out.opt(1, "Link Speed", link_text(controller));
@@ -32,6 +35,49 @@ pub(super) fn section(drives: &[DriveInfo]) -> Section {
         out.blank();
     }
     out.into_section("Storage")
+}
+
+/// The health records a drive reported, one line each.
+fn health_lines(out: &mut Lines, health: &DriveHealth) {
+    out.opt(1, "Temperature", health.temperature_c.map(|celsius| format!("{celsius:.0} °C")));
+    out.opt(1, "Percentage Used", health.percent_used.map(|percent| format!("{percent} %")));
+    out.opt(1, "Available Spare", health.available_spare.map(|percent| format!("{percent} %")));
+    out.opt(1, "Power On Hours", health.power_on_hours.map(|hours| format!("{hours} hours")));
+    out.opt(1, "Power Cycles", health.power_cycles);
+    out.opt(1, "Unsafe Shutdowns", health.unsafe_shutdowns);
+    out.opt(1, "Media Errors", health.media_errors);
+    out.opt(1, "Host Reads", health.bytes_read.map(data_text));
+    out.opt(1, "Host Writes", health.bytes_written.map(data_text));
+    out.opt(1, "Critical Warning", health.critical_warning.map(critical_warning_text));
+}
+
+/// `0.5 GB`, `28.6 TB` - an amount of data in binary gigabytes, or terabytes from 1024 GB on.
+fn data_text(bytes: u128) -> String {
+    let gigabytes = bytes as f64 / GIB;
+    if gigabytes < 1024.0 {
+        format!("{gigabytes:.1} GB")
+    } else {
+        format!("{:.1} TB", gigabytes / 1024.0)
+    }
+}
+
+/// `None`, `Temperature, Reliability degraded` - the conditions an NVMe drive flags.
+fn critical_warning_text(flags: u8) -> String {
+    const CONDITIONS: [&str; 5] =
+        ["Spare below threshold", "Temperature", "Reliability degraded", "Read-only", "Backup failed"];
+    let raised: Vec<&str> = CONDITIONS
+        .iter()
+        .enumerate()
+        .filter(|(bit, _)| flags & (1 << bit) != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if flags == 0 {
+        "None".to_string()
+    } else if raised.is_empty() {
+        format!("0x{flags:02X}")
+    } else {
+        raised.join(", ")
+    }
 }
 
 /// `Fixed, SSD`, `Fixed`, `Removable` - whether the medium comes out, and whether the
@@ -77,6 +123,62 @@ mod tests {
     use crate::demo;
     use crate::model::PcieLink;
     use crate::report::txt::lines_of;
+
+    /// The lines of a section with each run of tabs written as `|`.
+    fn fields(section: &Section) -> Vec<String> {
+        lines_of(section)
+            .iter()
+            .map(|line| line.split('\t').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("|"))
+            .collect()
+    }
+
+    #[test]
+    fn lists_the_health_a_drive_reports() {
+        let healthy = DriveInfo {
+            name: "SSD".into(),
+            health: Some(DriveHealth {
+                temperature_c: Some(38.0),
+                percent_used: Some(3),
+                available_spare: Some(100),
+                power_on_hours: Some(4_312),
+                power_cycles: Some(1_187),
+                unsafe_shutdowns: Some(41),
+                media_errors: Some(0),
+                bytes_read: Some(31_457_280_000_000),
+                bytes_written: Some(536_870_912),
+                critical_warning: Some(0),
+            }),
+            ..DriveInfo::default()
+        };
+        let lines = fields(&section(&[healthy]));
+        for expected in [
+            "Temperature|38 °C",
+            "Percentage Used|3 %",
+            "Available Spare|100 %",
+            "Power On Hours|4312 hours",
+            "Power Cycles|1187",
+            "Unsafe Shutdowns|41",
+            "Media Errors|0",
+            "Host Reads|28.6 TB",
+            "Host Writes|0.5 GB",
+            "Critical Warning|None",
+        ] {
+            assert!(lines.iter().any(|line| line == expected), "{expected} missing from {lines:?}");
+        }
+        let failing = DriveInfo {
+            health: Some(DriveHealth { critical_warning: Some(0b0110), ..DriveHealth::default() }),
+            ..DriveInfo::default()
+        };
+        let lines = fields(&section(&[failing]));
+        assert!(
+            lines.iter().any(|line| line == "Critical Warning|Temperature, Reliability degraded"),
+            "{lines:?}"
+        );
+        // A drive without health records gets no such lines.
+        assert!(!fields(&section(&[DriveInfo::default()]))
+            .iter()
+            .any(|line| line.starts_with("Temperature")));
+    }
 
     #[test]
     fn describes_drives() {

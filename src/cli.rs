@@ -13,6 +13,7 @@ Usage: rs-cpuz [options]
   -snap=DIR        render every tab to a .bmp file in DIR and exit
   -dump            print the detected hardware model and exit
   -demo            use the built-in sample system instead of probing hardware
+  -noadmin         do not ask for administrator rights when the window opens
   -help            show this text
 
 A relative NAME or DIR is resolved next to the executable.";
@@ -33,12 +34,14 @@ pub struct Args {
     pub command: Command,
     pub core: Option<u32>,
     pub demo: bool,
+    /// Do not ask for elevation when the window opens.
+    pub no_admin: bool,
 }
 
 /// Parses the arguments after the program name. Options start with `-`, `--` or `/`
 /// and are case-insensitive.
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
-    let mut parsed = Args { command: Command::Gui, core: None, demo: false };
+    let mut parsed = Args { command: Command::Gui, core: None, demo: false, no_admin: false };
     for arg in args {
         let body = arg
             .strip_prefix("--")
@@ -58,6 +61,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
             "dump" => parsed.command = Command::Dump,
             "help" | "h" | "?" => parsed.command = Command::Help,
             "demo" => parsed.demo = true,
+            "noadmin" => parsed.no_admin = true,
             "core" => {
                 let v = required()?;
                 parsed.core = Some(v.parse().map_err(|_| format!("`{v}` is not a core number"))?);
@@ -91,7 +95,10 @@ mod tests {
 
     #[test]
     fn defaults_to_gui() {
-        assert_eq!(args(&[]).unwrap(), Args { command: Command::Gui, core: None, demo: false });
+        assert_eq!(
+            args(&[]).unwrap(),
+            Args { command: Command::Gui, core: None, demo: false, no_admin: false }
+        );
     }
 
     #[test]
@@ -101,8 +108,15 @@ mod tests {
         assert_eq!(args(&["/bench"]).unwrap().command, Command::Bench);
         assert_eq!(
             args(&["-snap=shots", "-demo"]).unwrap(),
-            Args { command: Command::Snap("shots".into()), core: None, demo: true }
+            Args { command: Command::Snap("shots".into()), core: None, demo: true, no_admin: false }
         );
+    }
+
+    #[test]
+    fn parses_noadmin() {
+        assert!(args(&["-noadmin"]).unwrap().no_admin);
+        assert!(args(&["/NoAdmin", "-core=2"]).unwrap().no_admin);
+        assert!(!args(&["-demo"]).unwrap().no_admin);
     }
 
     #[test]

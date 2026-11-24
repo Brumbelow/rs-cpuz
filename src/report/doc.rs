@@ -4,7 +4,7 @@
 use std::fmt::Display;
 
 use crate::brand;
-use crate::model::{ClockSnapshot, CpuidLeaf, SystemInfo};
+use crate::model::{AccessInfo, ClockSnapshot, CpuidLeaf, SystemInfo};
 
 use super::{board, devices, dmi, processor, storage};
 
@@ -118,7 +118,7 @@ fn single_line(text: String) -> String {
 /// Builds every section of the report, in output order.
 pub(super) fn build(sys: &SystemInfo, clocks: Option<&ClockSnapshot>) -> Vec<Section> {
     vec![
-        binaries(),
+        binaries(&sys.notes, &sys.access),
         processor::processors(&sys.cpu),
         processor::apics(&sys.cpu),
         processor::timers(&sys.timers),
@@ -127,7 +127,7 @@ pub(super) fn build(sys: &SystemInfo, clocks: Option<&ClockSnapshot>) -> Vec<Sec
         board::bios(&sys.mainboard),
         board::chipset(&sys.mainboard, &sys.memory),
         board::spd(&sys.modules),
-        board::monitoring(&sys.mainboard),
+        board::monitoring(&sys.mainboard, &sys.sensors),
         devices::pci(&sys.pci),
         dmi::section(sys.smbios.as_ref()),
         storage::section(&sys.drives),
@@ -162,9 +162,17 @@ pub(super) const SECTION_TITLES: [&str; 18] = [
     "Software",
 ];
 
-fn binaries() -> Section {
+/// The version of this tool, the rights the report was made with, and the parts of the
+/// machine detection could not read.
+fn binaries(notes: &[String], access: &AccessInfo) -> Section {
     let mut out = Lines::default();
     out.pair(0, &format!("{} version", brand::APP_NAME), brand::VERSION);
+    if !access.driver.is_empty() {
+        out.pair(0, "Access", access.text());
+    }
+    for note in notes {
+        out.pair(0, "Note", note);
+    }
     out.into_section("Binaries")
 }
 
@@ -172,6 +180,35 @@ fn binaries() -> Section {
 mod tests {
     use super::*;
     use crate::demo;
+
+    #[test]
+    fn the_report_says_what_rights_it_was_made_with() {
+        let access = AccessInfo { administrator: true, driver: "PawnIO: 2.2.0".into() };
+        let lines = crate::report::txt::lines_of(&binaries(&[], &access));
+        assert!(
+            lines.iter().any(
+                |line| line.starts_with("Access") && line.ends_with("Administrator: yes · PawnIO: 2.2.0")
+            ),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn detection_notes_lead_the_report() {
+        let mut sys = demo::system();
+        sys.notes = vec!["USB devices: not read, no answer in time".into()];
+        let lines = crate::report::txt::lines_of(&binaries(&sys.notes, &sys.access));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("Note")
+                    && line.ends_with("USB devices: not read, no answer in time")),
+            "{lines:?}"
+        );
+        assert!(!crate::report::txt::lines_of(&binaries(&[], &sys.access))
+            .iter()
+            .any(|line| line.starts_with("Note")));
+    }
 
     #[test]
     fn keeps_values_on_one_line() {

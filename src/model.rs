@@ -25,6 +25,32 @@ pub struct SystemInfo {
     pub pci: Vec<PciDevice>,
     pub smbios: Option<Smbios>,
     pub timers: Vec<TimerFrequency>,
+    /// One reading of every sensor detection found, for the reports.
+    pub sensors: Vec<Sensor>,
+    /// What detection could not read, and why, e.g. `USB devices: not read, no answer in time`.
+    pub notes: Vec<String>,
+    /// The rights detection ran with, and what that gave access to.
+    pub access: AccessInfo,
+}
+
+/// The rights detection ran with.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccessInfo {
+    pub administrator: bool,
+    /// Where the ring-0 driver stands, e.g. `PawnIO: 2.2.0` or `PawnIO: not installed`.
+    pub driver: String,
+}
+
+impl AccessInfo {
+    /// `Administrator: yes · PawnIO: 2.2.0`, `Administrator: no · PawnIO: needs administrator`.
+    pub fn text(&self) -> String {
+        let rights = if self.administrator { "Administrator: yes" } else { "Administrator: no" };
+        if self.driver.is_empty() {
+            rights.to_string()
+        } else {
+            format!("{rights} · {}", self.driver)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +212,8 @@ pub struct CpuInfo {
     pub max_tdp_w: Option<f32>,
     /// Needs a ring-0 backend; `None` in user mode.
     pub core_voltage: Option<f32>,
+    /// Lowest and highest multiplier as the processor's own registers state them (ring 0).
+    pub ratio_range: Option<(f64, f64)>,
     pub family: u8,
     pub model: u8,
     pub stepping: u8,
@@ -260,6 +288,45 @@ pub struct ClockSnapshot {
 pub struct TimerFrequency {
     pub name: String,
     pub hz: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Sensors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensorKind {
+    /// Degrees Celsius.
+    Temperature,
+    /// Watts.
+    Power,
+    /// Revolutions per minute.
+    Fan,
+    /// Volts.
+    Voltage,
+}
+
+/// One reading of a temperature, voltage, power or fan sensor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sensor {
+    /// What the sensor belongs to, e.g. `CPU`, `ACPI` or a drive's name.
+    pub group: String,
+    /// e.g. `Package`, `TZ00`, `Temperature`.
+    pub name: String,
+    pub kind: SensorKind,
+    pub value: f64,
+}
+
+impl Sensor {
+    /// `52.0 °C`, `21.28 W`, `1200 RPM` - the reading with its unit.
+    pub fn value_text(&self) -> String {
+        match self.kind {
+            SensorKind::Temperature => format!("{:.1} °C", self.value),
+            SensorKind::Power => format!("{:.2} W", self.value),
+            SensorKind::Fan => format!("{:.0} RPM", self.value),
+            SensorKind::Voltage => format!("{:.3} V", self.value),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -528,9 +595,33 @@ pub struct DriveInfo {
     pub bus_type: Option<u32>,
     /// e.g. `SMART`.
     pub features: Vec<String>,
+    /// The health records the drive gave out, as far as they were readable.
+    pub health: Option<DriveHealth>,
     pub controller: Option<DriveController>,
     /// The mounted volumes that lie on the drive, by drive letter.
     pub volumes: Vec<VolumeInfo>,
+}
+
+/// What a drive keeps of its own health. Every field is what the drive reported; a
+/// drive that reports less leaves the rest unset.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DriveHealth {
+    /// Current temperature in degrees Celsius.
+    pub temperature_c: Option<f32>,
+    /// Share of the rated endurance used so far, in percent; may exceed 100.
+    pub percent_used: Option<u32>,
+    /// Spare capacity left, in percent.
+    pub available_spare: Option<u32>,
+    pub power_on_hours: Option<u64>,
+    pub power_cycles: Option<u64>,
+    /// Times the drive lost power without being told first.
+    pub unsafe_shutdowns: Option<u64>,
+    pub media_errors: Option<u64>,
+    /// Data the host read from and wrote to the drive, in bytes.
+    pub bytes_read: Option<u128>,
+    pub bytes_written: Option<u128>,
+    /// An NVMe drive's critical warning flags: 0 when all is well.
+    pub critical_warning: Option<u8>,
 }
 
 /// The PCI device a drive is attached to.
@@ -678,6 +769,15 @@ mod tests {
         assert_eq!(gpu.current_perf_level(), 0);
         gpu.perf_levels.clear();
         assert_eq!(gpu.current_perf_level(), 0);
+    }
+
+    #[test]
+    fn sensor_values_carry_their_unit() {
+        let sensor = |kind, value| Sensor { group: String::new(), name: String::new(), kind, value };
+        assert_eq!(sensor(SensorKind::Temperature, 52.04).value_text(), "52.0 °C");
+        assert_eq!(sensor(SensorKind::Power, 21.2827).value_text(), "21.28 W");
+        assert_eq!(sensor(SensorKind::Fan, 1200.4).value_text(), "1200 RPM");
+        assert_eq!(sensor(SensorKind::Voltage, 1.2051).value_text(), "1.205 V");
     }
 
     #[test]

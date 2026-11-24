@@ -455,6 +455,8 @@ pub mod about {
     pub const SAVE_HTML: u16 = 710;
     pub const CLOCKS: u16 = 711;
     pub const TIMERS: u16 = 712;
+    pub const ACCESS: u16 = 713;
+    pub const NOTES: u16 = 714;
 }
 
 // ---------------------------------------------------------------------------
@@ -775,8 +777,10 @@ const ABOUT: &[Item] = &[
     item(Kind::Emblem, about::EMBLEM, 14, 11, 29, 28, ""),
     item(Kind::Title, about::NAME, 50, 11, 160, 16, ""),
     item(Kind::Text, about::VERSION, 51, 28, 160, 9, ""),
-    item(Kind::Info, about::DESCRIPTION, 16, 58, 229, 9, "Open-source system profiler for Windows"),
-    item(Kind::Heading, about::LICENSE, 16, 70, 229, 9, ""),
+    item(Kind::Info, about::DESCRIPTION, 16, 50, 229, 9, "Open-source system profiler for Windows"),
+    item(Kind::Heading, about::LICENSE, 16, 59, 229, 9, ""),
+    item(Kind::Heading, about::ACCESS, 16, 68, 229, 9, ""),
+    item(Kind::Heading, about::NOTES, 16, 77, 229, 9, ""),
     item(Kind::Info, about::OS_NAME, 16, 99, 229, 9, ""),
     item(Kind::Info, about::OS_BUILD, 16, 110, 229, 9, ""),
     item(Kind::Info, about::DIRECTX, 90, 121, 82, 9, ""),
@@ -826,6 +830,14 @@ pub mod clocks_tool {
     pub const fn visible_rows() -> usize {
         ((TABLE.h - HEADER_HEIGHT - 1) / ROW_HEIGHT) as usize
     }
+}
+
+/// The Sensors tool shares the Clocks tool's frame, table and button.
+pub mod sensors_tool {
+    pub use super::clocks_tool::{OK, SIZE};
+
+    /// Column titles and widths; the widths add up to the table width.
+    pub const COLUMNS: [(&str, i32); 3] = [("Sensor", 145), ("Value", 62), ("Max", 62)];
 }
 
 pub mod timers_tool {

@@ -75,8 +75,12 @@ pub fn instructions(vendor: CpuVendor, leaves: Leaves, xcr0: Option<u64>) -> Vec
     add(bit(l1.ecx, 20), "SSE4.2");
     add(amd_bit(ext.ecx, 6), "SSE4A");
     add(bit(ext.edx, 29), if intel { "EM64T" } else { "x86-64" });
-    add(intel && bit(l1.ecx, 5), "VT-x");
-    add(amd_bit(ext.ecx, 2), "AMD-V");
+    // Hyper-V hides VMX and SVM from every partition, the host included; on the host they
+    // are there all the same, enabled and in use by the hypervisor.
+    let host = hyper_v_root(leaves);
+    let amd_family = matches!(vendor, CpuVendor::Amd | CpuVendor::Hygon);
+    add(intel && (bit(l1.ecx, 5) || host), "VT-x");
+    add(amd_bit(ext.ecx, 2) || amd_family && host, "AMD-V");
     add(bit(l1.ecx, 25), "AES");
     add(avx && bit(l1.ecx, 28), "AVX");
     add(avx && bit(l7.ebx, 5), "AVX2");
@@ -90,6 +94,15 @@ pub fn instructions(vendor: CpuVendor, leaves: Leaves, xcr0: Option<u64>) -> Vec
     add(bit(l7.ebx, 29), "SHA");
     add(amx && bit(l7.edx, 24), "AMX");
     list
+}
+
+/// Whether the code runs in the root partition of Hyper-V: the hypervisor identifies
+/// itself as Microsoft's and grants the CreatePartitions privilege, which only the root
+/// partition holds. A guest never has it.
+fn hyper_v_root(leaves: Leaves) -> bool {
+    let vendor = leaves.regs(0x4000_0000, 0);
+    let microsoft = (vendor.ebx, vendor.ecx, vendor.edx) == (0x7263_694D, 0x666F_736F, 0x7648_2074);
+    microsoft && bit(leaves.regs(0x4000_0003, 0).ebx, 0)
 }
 
 /// `AVX512 (DQ, BW, ...)`: the foundation is implied, the sub-features are listed.
@@ -125,7 +138,7 @@ mod tests {
 
     #[test]
     fn zen4_under_a_hypervisor() {
-        // AMD-V is hidden from the root partition, so it must not be listed.
+        // The hypervisor hides AMD-V, and without its own leaves nothing says the processor has it.
         assert_eq!(
             joined(CpuVendor::Amd, &zen4(0), Some(0xE7)),
             "MMX (+), SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2, SSE4A, x86-64, AES, AVX, AVX2, \
@@ -139,6 +152,37 @@ mod tests {
             joined(CpuVendor::Intel, &hybrid(0, true), Some(0x7)),
             "MMX, SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2, EM64T, VT-x, AES, AVX, AVX2, AVX-VNNI, FMA3, SHA"
         );
+    }
+
+    /// `table` as Hyper-V shows it to a partition: VMX and SVM hidden, the hypervisor's
+    /// vendor leaf, and the partition privileges with CreatePartitions as given.
+    fn under_hyper_v(mut table: Vec<CpuidLeaf>, root: bool) -> Vec<CpuidLeaf> {
+        for l1 in table.iter_mut().filter(|l| l.leaf == 1) {
+            l1.ecx &= !(1 << 5);
+        }
+        for ext in table.iter_mut().filter(|l| l.leaf == 0x8000_0001) {
+            ext.ecx &= !(1 << 2);
+        }
+        table.push(leaf(0x4000_0000, 0, 0x4000_000C, 0x7263_694D, 0x666F_736F, 0x7648_2074));
+        table.push(leaf(0x4000_0003, 0, 0x0000_3FFF, if root { 0x002B_B9FF } else { 0x002B_B9FE }, 0, 0));
+        table
+    }
+
+    #[test]
+    fn the_hyper_v_root_partition_keeps_vt_x() {
+        // Hyper-V uses VMX itself and hides it from CPUID; the root partition is the host.
+        let list = instructions(CpuVendor::Intel, Leaves(&under_hyper_v(hybrid(0, true), true)), Some(0x7));
+        assert!(list.iter().any(|name| name == "VT-x"), "{list:?}");
+        let list = instructions(CpuVendor::Amd, Leaves(&under_hyper_v(zen4(0), true)), Some(0xE7));
+        assert!(list.iter().any(|name| name == "AMD-V"), "{list:?}");
+    }
+
+    #[test]
+    fn a_guest_partition_lists_no_virtualization() {
+        let list = instructions(CpuVendor::Intel, Leaves(&under_hyper_v(hybrid(0, true), false)), Some(0x7));
+        assert!(!list.iter().any(|name| name == "VT-x"), "{list:?}");
+        let list = instructions(CpuVendor::Amd, Leaves(&under_hyper_v(zen4(0), false)), Some(0xE7));
+        assert!(!list.iter().any(|name| name == "AMD-V"), "{list:?}");
     }
 
     #[test]
