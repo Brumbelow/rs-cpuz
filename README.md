@@ -1,102 +1,133 @@
 # rs-cpuz
 
-A small, fast system profiler for Windows written in Rust. It shows what is
-inside the machine — processor, caches, mainboard, BIOS, memory, memory
-modules and graphics adapters — in a compact tabbed window, and can write the
-same information as a text or HTML report. The reports go further than the
-window: they also list the drives with their volumes, the USB devices and the
-connected monitors.
+System profiler for Windows, written in Rust. Tabbed window, text and HTML reports.
 
-rs-cpuz is written from scratch in the style of the classic tabbed CPU
-information utilities: the tab layout and the report format will feel
-familiar, but every line of code, every lookup table and all of the artwork
-are original.
+- One executable, about 2 MB. No installer, no runtime dependencies.
+- Runs without administrator rights. Asks for them at start to read more (see [Administrator rights and PawnIO](#administrator-rights-and-pawnio)).
+- Reports also list drives, volumes, drive health, USB devices, monitors and sensors.
+- Benchmark and stress test.
+- Command-line reports, tab snapshots and benchmark runs.
+- Dark UI, per-monitor DPI aware.
 
-- Single ~1.3 MB executable, no installer, no runtime dependencies
-- Runs as a normal user: **no kernel driver, no elevation prompt**
-- Custom-drawn dark UI, per-monitor DPI aware
-- Built-in CPU benchmark and stress test
-- Scriptable: reports, tab snapshots and benchmark runs from the command line
+## Requirements
+
+- Windows 10 1709 or later, or Windows 11. x64 (an x86 build is possible).
+- Optional: the [PawnIO](https://pawnio.eu) driver, for ring-0 data.
 
 ## Tabs
 
-| Tab | What it shows |
+| Tab | Contents |
 | --- | --- |
-| **CPU** | Name, code name, package, process node, TDP, family/model/stepping, revision, instruction sets, live core speed, multiplier and bus speed, cache hierarchy, core and thread counts |
-| **Mainboard** | Board vendor and model, bus specification, chipset and southbridge, BIOS brand/version/date, microcode, graphic interface link width and speed |
-| **Memory** | Type, size, channels, DRAM frequency and FSB:DRAM ratio |
-| **SPD** | Per-slot module size, type, bandwidth, manufacturer, part and serial number |
-| **Graphics** | Adapter name, board vendor, code name, revision, process node, clocks, memory size and type |
-| **Bench** | Single and multi thread benchmark, stress test, saved reference scores |
-| **About** | Version, Windows build, DirectX level, report and tool buttons |
+| CPU | Name, code name, package, process node, TDP, family/model/stepping, revision, instruction sets, core speed, multiplier, bus speed, caches (per core type on hybrid CPUs), core and thread counts. With PawnIO: core voltage, multiplier range |
+| Mainboard | Board vendor and model, bus specification, chipset, southbridge, BIOS brand/version/date, microcode, graphic interface link width and speed |
+| Memory | Type, size, channels, DRAM frequency, FSB:DRAM. With PawnIO: CL, tRCD, tRP, tRAS, tRC, uncore frequency |
+| SPD | Per slot: size, type, bandwidth, manufacturer, part and serial number. With PawnIO: JEDEC timings |
+| Graphics | Adapter, board vendor, code name, revision, process node, clocks, memory size and type, TMUs |
+| Bench | Single- and multi-thread benchmark, stress test, saved reference scores |
+| About | Version, Windows build, DirectX level, access level, count of parts that could not be read |
 
-The **Tools** button opens two extra windows: **Clocks** (live frequency and
-multiplier of every core) and **Timers** (the system's time sources run side
-by side to spot drift).
+## Tools menu
+
+| Entry | Function |
+| --- | --- |
+| Save Report (.TXT) / (.HTML) | Write a report |
+| Clocks | Frequency and multiplier of every core |
+| Timers | System time sources side by side |
+| Sensors | Power, temperature, fan and voltage readings, updated every second |
+| Restart as Administrator | Shown when not elevated, except with `-demo` |
+
+## Administrator rights and PawnIO
+
+Elevation:
+
+- At window start, an administrator running with a filtered token gets a UAC prompt. Standard users are not prompted.
+- Declined prompt: the program continues without administrator rights.
+- No prompt with `-noadmin`, `Elevate=0`, `-demo`, or any command-line report mode.
+
+PawnIO is used when all of these hold:
+
+- the driver is installed (from [pawnio.eu](https://pawnio.eu));
+- the program runs as administrator;
+- `PawnIO=1` (default).
+
+Access is read-only. rs-cpuz has no code path that writes an MSR, a memory-controller register or an SMBus device.
+
+| Data | Processors |
+| --- | --- |
+| Core voltage (VID), package and per-core temperatures, multiplier range | Intel Core, Sandy Bridge to Arrow Lake |
+| Uncore (ring) frequency | Intel Core, Skylake to Raptor Lake |
+| Memory timings, exact channel count | Intel 12th to 14th Gen desktop and HX (Alder Lake-S, Raptor Lake-S) |
+| SPD JEDEC timings | Intel chipsets (i801 SMBus). DDR5: only the SPD page the firmware left selected |
+
+AMD processors: nothing is read through PawnIO.
+
+SMBus reads hold the `Global\Access_SMBUS.HTP.Method` mutex, shared with other monitoring tools.
+
+The About tab and the reports show the status:
+
+| Text | Meaning |
+| --- | --- |
+| `Administrator: yes` / `no` | Process elevation |
+| `PawnIO: <version>` | Driver in use |
+| `PawnIO: not installed` | No driver |
+| `PawnIO: needs administrator` | Driver installed, process not elevated |
+| `PawnIO: disabled` | `PawnIO=0` |
+| `PawnIO: <version> installed, not running` | Device does not open |
+| `PawnIO: <version> (nothing to read on this processor)` | Processor not supported |
+
+The PawnIO modules (`IntelMSR`, `IntelMCHBAR`, `SmbusI801`, PawnIO.Modules 0.2.12) are embedded in the executable. License LGPL-2.1-or-later. Hashes and source: [assets/pawnio](assets/pawnio/README.md).
 
 ## Building
 
-rs-cpuz builds with stable Rust (1.78 or newer) on Windows x86-64.
+Rust 1.81 or newer.
 
 ```bash
 cargo build --release
-```
-
-The executable is written to `target/release/rs-cpuz.exe`. The icon, version
-information and manifest are generated by the build script and linked in, so
-there is nothing else to ship.
-
-Both Windows toolchains work:
-
-- **MSVC** (`x86_64-pc-windows-msvc`) needs the Visual Studio build tools,
-  which provide `rc.exe`.
-- **GNU** (`x86_64-pc-windows-gnu`) needs a MinGW-w64 toolchain with `gcc`
-  and `windres` on `PATH`.
-
-```bash
 cargo test
 ```
 
+Output: `target/release/rs-cpuz.exe`. The icon, version information and manifest are linked in by the build script.
+
+| Toolchain | Needs |
+| --- | --- |
+| MSVC (`x86_64-pc-windows-msvc`) | Visual Studio build tools (`rc.exe`). The C runtime is linked statically through `.cargo/config.toml`, which Cargo reads from the current directory: build from the repository root. |
+| GNU (`x86_64-pc-windows-gnu`) | MinGW-w64 with `gcc` and `windres` on `PATH`. Also builds from Linux with `--target x86_64-pc-windows-gnu`. |
+
 ## Command line
 
-Run without arguments to open the window. Options may start with `-`, `--`
-or `/` and are not case sensitive.
+No option opens the window. Options start with `-`, `--` or `/` and are not case sensitive.
 
 | Option | Effect |
 | --- | --- |
 | `-txt=NAME` | Write the text report to `NAME.txt` and exit |
 | `-html=NAME` | Write the HTML report to `NAME.htm` and exit |
-| `-bench` | Run the benchmark without a window and save the scores |
+| `-bench` | Run the benchmark without a window, save the scores to `<computer name>.txt` |
 | `-core=N` | Show the clocks of core `N` on the CPU tab |
-| `-snap=DIR` | Render every tab to a `.bmp` file in `DIR` and exit |
+| `-snap=DIR` | Save every tab as a `.bmp` file in `DIR` and exit |
 | `-dump` | Print the detected hardware model and exit |
-| `-demo` | Use a built-in sample system instead of probing the hardware |
+| `-demo` | Use a built-in sample system instead of the hardware |
+| `-noadmin` | Do not ask for administrator rights at window start |
 | `-help` | Show the option list |
 
-A relative `NAME` or `DIR` is resolved next to the executable.
+A relative `NAME` or `DIR` is resolved next to the executable. Benchmark scores and saved references go to the executable's folder, or to `%APPDATA%\rs-cpuz` when that folder is read-only (for example under Program Files).
 
-`-help`, `-dump` and error messages are printed on the console rs-cpuz was
-started from. It is a windowed program, and an interactive shell does not
-wait for one to finish, so that text can appear after the next prompt.
-Output that is redirected to a file or piped into another program goes there
-as usual.
+`-help`, `-dump` and errors print to the console that started rs-cpuz. It is a windowed program, so an interactive shell does not wait for it and the text can appear after the next prompt. Redirected or piped output is unaffected.
 
 ## Keyboard
 
 | Key | Action |
 | --- | --- |
-| `F5` | Save the current tab as a `.bmp` picture |
+| `F5` | Save the current tab as `.bmp` |
 | `F6` | Copy the current tab to the clipboard |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Up` / `Down` / `PgUp` / `PgDn` / `Home` / `End` | Move through an open list, scroll the Clocks table |
 | `Esc` | Close a list or tool window |
 
-Right-click the Clocks group on the CPU tab to pick which core it follows.
+Right-click the Clocks group on the CPU tab to choose the core it shows.
 
 ## Configuration
 
-An optional `rs-cpuz.ini` next to the executable changes fonts and switches
-detection stages off:
+Optional `rs-cpuz.ini`, read from the executable's folder, then `%APPDATA%\rs-cpuz`.
 
 ```ini
 [RS-CPUZ]
@@ -108,78 +139,59 @@ LabelFontSize=14
 DMI=1
 PCI=1
 Display=1
+Elevate=1
+PawnIO=1
 ```
 
-The `TextFont` keys style the values in the boxes and lists, the `LabelFont`
-keys the labels, buttons and tab titles; the window chrome keeps its colours.
-`TextFontColor` is `RRGGBB` in hexadecimal. `DMI`, `PCI` and `Display` accept
-`1`/`0` and turn off the SMBIOS, PCI and display-adapter queries. Without the
-PCI queries the reports list the drives without their controllers, and without
-the display queries they leave out the monitors as well.
+| Key | Default | Effect |
+| --- | --- | --- |
+| `TextFontName`, `TextFontSize`, `TextFontColor` | built-in, 14, theme | Font of values in boxes and lists. Colour is `RRGGBB` hex |
+| `LabelFontName`, `LabelFontSize` | built-in, 14 | Font of labels, buttons and tab titles |
+| `DMI` | 1 | `0`: skip the SMBIOS tables |
+| `PCI` | 1 | `0`: skip PCI devices. Reports then list drives without their controllers |
+| `Display` | 1 | `0`: skip display adapters. Reports then omit monitors |
+| `Elevate` | 1 | `0`: no UAC prompt at window start |
+| `PawnIO` | 1 | `0`: never use the PawnIO driver |
 
-## How it reads the hardware
+Flags accept `1`/`0`, `on`/`off`, `true`/`false`, `yes`/`no`. Any text encoding Notepad saves is read.
 
-Everything comes from documented, unprivileged interfaces:
+## Data sources
 
 | Data | Source |
 | --- | --- |
-| Processor identification, caches, features | the `CPUID` instruction, one pass per logical processor |
+| Processor identification, caches, features | `CPUID`, once per logical processor |
 | Topology, hybrid core types | `GetLogicalProcessorInformationEx` |
-| Preferred cores | the scheduling classes of `GetSystemCpuSetInformation` |
-| Core speed | the processor performance counters and a calibrated time-stamp counter |
-| Mainboard, BIOS, memory modules | the firmware SMBIOS table (`GetSystemFirmwareTable`) |
+| Preferred cores | `GetSystemCpuSetInformation` scheduling classes |
+| Core speed | Processor performance counters, calibrated time-stamp counter |
+| Mainboard, BIOS, memory modules | SMBIOS (`GetSystemFirmwareTable`) |
 | Chipset, PCI devices, link width and speed | SetupAPI device properties |
-| Graphics adapters | DXGI, the graphics kernel's adapter queries (`D3DKMTQueryAdapterInfo`), the display class registry keys and, when present, the vendor's public API |
-| Monitors | the EDID Windows keeps for every connected display |
-| Drives and volumes | the storage property queries (`IOCTL_STORAGE_QUERY_PROPERTY`) on disk handles opened without read or write access, and `GetDiskFreeSpaceEx` |
-| USB devices | SetupAPI device properties and the connection information of the hubs (`IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX`) |
-| Hardware error count | the WHEA events in the System event log |
+| Graphics adapters | DXGI, `D3DKMTQueryAdapterInfo`, display class registry keys, NVAPI when present |
+| GPU temperature, fan, clocks | D3DKMT adapter performance data, NVAPI |
+| CPU power | `\Energy Meter(*)` performance counters (RAPL) |
+| ACPI temperatures | `\Thermal Zone Information(*)` performance counters |
+| Monitors | EDID stored by Windows |
+| Drives and volumes | `IOCTL_STORAGE_QUERY_PROPERTY` on disk handles opened without read or write access, `GetDiskFreeSpaceEx` |
+| Drive health and temperature | NVMe health log, ATA device statistics log (04h). Not queried while a disk is spun down |
+| USB devices | SetupAPI, `IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX` |
+| Hardware error count | WHEA events in the System event log |
+| Ring-0 data | PawnIO (optional, see above) |
 
 ## Limitations
 
-Some figures can only be read from ring 0 (model-specific registers, port
-I/O, SMBus). rs-cpuz deliberately ships no driver, so these fields are left
-blank rather than guessed:
-
-- core voltage, temperatures and power draw
-- memory timings and the SPD timing tables (JEDEC, XMP and EXPO profiles)
-- the Super I/O (LPCIO) chip and the hardware monitors behind it
-- the minimum multiplier and the rated FSB
-- register dumps (PCI configuration space, SPD contents)
-
-A drive is listed with SMART among its features when it keeps those health
-records; the records themselves are not part of the report.
-
-Core speed is the effective frequency Windows measured while the core was
-busy, so an idle core can read a little lower than tools that latch the
-current P-state from an MSR.
-
-The FSB:DRAM ratio is stated against the nominal 100 MHz base clock, which
-cannot be read from user mode. It is left blank when the firmware reports
-another bus clock; a board that runs a different strap while its firmware
-still reports 100 MHz shows the nominal ratio.
-
-Benchmark scores use rs-cpuz's own workload. They are comparable between
-machines running the same rs-cpuz benchmark version and with nothing else.
-**Save as Reference** stores a result under the processor's name; a run on
-fewer threads than the processor has is kept apart from the full one, with
-the thread count added to the name. With `-demo` the benchmark still measures
-the real processor, on as many threads as Windows reports, so its result
-cannot be saved under the sample system's name; the file written by
-`-bench -demo` is named after the sample system and holds this machine's
-scores.
-
-Code names, process nodes, packages and TDP figures come from tables in this
-repository; a part that is missing from them shows a blank field. Additions
-are welcome.
+- Without PawnIO and administrator rights, these are blank: core voltage, CPU temperatures (the ACPI zone is still read), memory timings, SPD timings, uncore frequency, minimum multiplier.
+- Not read: Super I/O (LPCIO) chip and its fans and voltages; XMP and EXPO profiles; the DDR5 SPD manufacturing page (needs a page-select write); command rate; tRFC; rated FSB; register dumps.
+- Core speed is the effective frequency while the core was busy. An idle core reads lower than tools that latch the P-state from an MSR.
+- The uncore frequency is the ratio times 100 MHz, not times the measured base clock.
+- FSB:DRAM assumes a 100 MHz base clock. Blank when the firmware reports another bus clock.
+- Benchmark scores use rs-cpuz's own workload and compare only within the same benchmark version.
+  - Save as Reference stores a result under the processor name. A run on fewer threads than the processor has is stored separately, with the thread count in the name.
+  - `-demo` still benchmarks the real processor. `-bench -demo` writes this machine's scores under the sample system's name.
+- Code names, process nodes, packages and TDP come from tables in this repository. A missing part shows blank fields.
 
 ## Disclaimer
 
-rs-cpuz is an independent project. It is not affiliated with or endorsed by
-CPUID, the makers of CPU-Z, by MSI or by any other hardware or software
-vendor, and it contains none of their code or artwork. All product names and
-trademarks belong to their respective owners.
+Independent project. Not affiliated with or endorsed by CPUID (CPU-Z), MSI or any other vendor. Contains none of their code or artwork. Product names and trademarks belong to their owners.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE-APACHE).
+[Apache License 2.0](LICENSE-APACHE). Embedded PawnIO modules: LGPL-2.1-or-later ([assets/pawnio/COPYING](assets/pawnio/COPYING)).
